@@ -22,8 +22,19 @@ const MaxCompressionHops = 5;
 /// Default negative cache TTL (RFC 2308 recommends max 3 hours).
 const DEFAULT_NEGATIVE_TTL_SEC: u32 = 300; // 5 minutes
 
+/// Minimum TTL floor to prevent cache churn (RFC 8767 recommends >= 1s).
+const MIN_TTL_SEC: u32 = 5;
+/// Maximum TTL cap to bound stale entries.
+const MAX_TTL_SEC: u32 = 86400; // 1 day
+
 /// Maximum cache entries.
 const MAX_CACHE_ENTRIES: usize = 1024;
+
+/// DNS query result carrying the resolved address and its TTL.
+const DnsResult = struct {
+    address: tcpip.Address,
+    ttl_sec: u32,
+};
 
 /// DNS cache entry.
 pub const CacheEntry = struct {
@@ -322,14 +333,18 @@ pub const Resolver = struct {
         }
 
         // 3. Perform DNS query
-        const result = self.performDnsQuery(hostname, record_type);
+        const dns_result = self.performDnsQuery(hostname, record_type);
 
         // 4. Cache the result (success or negative)
         if (self.cache_enabled) {
-            self.cacheResult(hostname, record_type, result) catch {};
+            if (dns_result) |res| {
+                self.cacheResult(hostname, record_type, res.address, res.ttl_sec) catch {};
+            } else |err| {
+                self.cacheNegative(hostname, record_type, err) catch {};
+            }
         }
 
-        return result;
+        if (dns_result) |res| return res.address else |err| return err;
     }
 
     fn makeCacheKey(self: *Resolver, hostname: []const u8, record_type: RecordType) ![]u8 {
@@ -338,60 +353,65 @@ pub const Resolver = struct {
         return key;
     }
 
-    fn cacheResult(self: *Resolver, hostname: []const u8, record_type: RecordType, result: anyerror!tcpip.Address) void {
-        // Limit cache size
-        if (self.cache.count() >= MAX_CACHE_ENTRIES) {
-            // Remove expired entries first
-            var to_remove = std.ArrayList([]const u8).init(self.allocator);
-            defer to_remove.deinit();
+    fn evictExpired(self: *Resolver) void {
+        if (self.cache.count() < MAX_CACHE_ENTRIES) return;
 
-            var it = self.cache.iterator();
-            while (it.next()) |kv| {
-                if (kv.value_ptr.isExpired()) {
-                    to_remove.append(kv.key_ptr.*) catch continue;
-                }
-            }
+        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        defer to_remove.deinit();
 
-            for (to_remove.items) |key| {
-                _ = self.cache.remove(key);
-                self.allocator.free(key);
+        var it = self.cache.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.isExpired()) {
+                to_remove.append(kv.key_ptr.*) catch continue;
             }
         }
 
-        const cache_key = self.makeCacheKey(hostname, record_type) catch return;
-
-        if (result) |addr| {
-            // NOTE: Use default TTL of 300s for caching
-            // Real TTL should come from DNS response
-            const entry = CacheEntry{
-                .address = addr,
-                .record_type = record_type,
-                .expires_at_ms = std.time.milliTimestamp() + 300 * 1000,
-                .is_negative = false,
-            };
-            self.cache.put(cache_key, entry) catch {
-                self.allocator.free(cache_key);
-            };
-        } else |err| {
-            if (err == error.NameNotFound) {
-                // Negative cache entry
-                const entry = CacheEntry{
-                    .address = null,
-                    .record_type = record_type,
-                    .expires_at_ms = std.time.milliTimestamp() + @as(i64, self.negative_ttl_sec) * 1000,
-                    .is_negative = true,
-                };
-                self.cache.put(cache_key, entry) catch {
-                    self.allocator.free(cache_key);
-                };
-            } else {
-                self.allocator.free(cache_key);
-            }
+        for (to_remove.items) |key| {
+            _ = self.cache.remove(key);
+            self.allocator.free(key);
         }
     }
 
+    /// Clamp TTL to [MIN_TTL_SEC, MAX_TTL_SEC].
+    fn clampTtl(ttl_sec: u32) u32 {
+        return @max(MIN_TTL_SEC, @min(ttl_sec, MAX_TTL_SEC));
+    }
+
+    fn cacheResult(self: *Resolver, hostname: []const u8, record_type: RecordType, addr: tcpip.Address, ttl_sec: u32) !void {
+        self.evictExpired();
+
+        const cache_key = try self.makeCacheKey(hostname, record_type);
+        const clamped = clampTtl(ttl_sec);
+        const entry = CacheEntry{
+            .address = addr,
+            .record_type = record_type,
+            .expires_at_ms = std.time.milliTimestamp() + @as(i64, clamped) * 1000,
+            .is_negative = false,
+        };
+        self.cache.put(cache_key, entry) catch {
+            self.allocator.free(cache_key);
+        };
+    }
+
+    fn cacheNegative(self: *Resolver, hostname: []const u8, record_type: RecordType, err: anyerror) !void {
+        if (err != error.NameNotFound) return;
+
+        self.evictExpired();
+
+        const cache_key = try self.makeCacheKey(hostname, record_type);
+        const entry = CacheEntry{
+            .address = null,
+            .record_type = record_type,
+            .expires_at_ms = std.time.milliTimestamp() + @as(i64, self.negative_ttl_sec) * 1000,
+            .is_negative = true,
+        };
+        self.cache.put(cache_key, entry) catch {
+            self.allocator.free(cache_key);
+        };
+    }
+
     /// Perform the actual DNS query over UDP.
-    fn performDnsQuery(self: *Resolver, hostname: []const u8, record_type: RecordType) !tcpip.Address {
+    fn performDnsQuery(self: *Resolver, hostname: []const u8, record_type: RecordType) !DnsResult {
         var wq = waiter.Queue{};
         const udp_proto = self.stack.transport_protocols.get(header.UDP.ProtocolNumber) orelse
             return error.NoUdpProtocol;
@@ -534,7 +554,8 @@ pub const Resolver = struct {
 
                 const rtype: RecordType = @enumFromInt(std.mem.readInt(u16, packet_flat[pos..][0..2], .big));
                 pos += 4; // Type + Class
-                pos += 4; // TTL
+                const ttl = std.mem.readInt(u32, packet_flat[pos..][0..4], .big);
+                pos += 4;
                 const rdlen = std.mem.readInt(u16, packet_flat[pos..][0..2], .big);
                 pos += 2;
 
@@ -543,11 +564,11 @@ pub const Resolver = struct {
                 if (rtype == .A and rdlen == 4 and record_type == .A) {
                     var ip: [4]u8 = undefined;
                     @memcpy(&ip, packet_flat[pos..][0..4]);
-                    return tcpip.Address{ .v4 = ip };
+                    return .{ .address = tcpip.Address{ .v4 = ip }, .ttl_sec = ttl };
                 } else if (rtype == .AAAA and rdlen == 16 and record_type == .AAAA) {
                     var ip: [16]u8 = undefined;
                     @memcpy(&ip, packet_flat[pos..][0..16]);
-                    return tcpip.Address{ .v6 = ip };
+                    return .{ .address = tcpip.Address{ .v6 = ip }, .ttl_sec = ttl };
                 }
                 pos += rdlen;
             }
