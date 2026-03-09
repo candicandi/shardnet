@@ -27,7 +27,7 @@ pub const Loopback = struct {
     dispatcher: ?*stack.NetworkDispatcher = null,
     mtu_val: u32 = 65536,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
-    queue: std.TailQueue(Packet),
+    queue: std.DoublyLinkedList(Packet),
     allocator: std.mem.Allocator,
 
     // NOTE: The node pool replaces raw allocator.create/destroy calls for
@@ -60,7 +60,7 @@ pub const Loopback = struct {
         enqueue_ts: i128,
     };
 
-    const QueueNode = std.TailQueue(Packet).Node;
+    const QueueNode = std.DoublyLinkedList(Packet).Node;
 
     // PERF: NodePool pre-allocates queue-node wrappers so the fast path
     // (acquire → enqueue → deliver → release) never touches the heap.

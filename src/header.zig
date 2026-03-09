@@ -86,6 +86,10 @@ pub const IPv4 = struct {
         return std.mem.readInt(u16, self.data[idOffset..][0..2], .big);
     }
 
+    pub fn ttl(self: IPv4) u8 {
+        return self.data[ttlOffset];
+    }
+
     pub fn isValid(self: IPv4, pkt_size: usize) bool {
         if (self.data.len < IPv4MinimumSize) return false;
         const hlen = self.headerLength();

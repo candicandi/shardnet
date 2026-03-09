@@ -87,7 +87,7 @@ pub fn debug(comptime format: []const u8, args: anytype) void {
 /// Example:
 ///   const dlog = log.scoped(.drivers);
 ///   dlog.info("rx burst: {d} packets", .{count});
-pub fn scoped(comptime scope: @Type(.EnumLiteral)) type {
+pub fn scoped(comptime scope: @Type(.enum_literal)) type {
     return struct {
         pub fn err(comptime format: []const u8, args: anytype) void {
             log(.err, @tagName(scope), format, args);

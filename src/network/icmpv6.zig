@@ -134,29 +134,29 @@ pub const ICMPv6PacketHandler = struct {
         const v = mut_pkt.data.first() orelse return;
         const h = header.ICMPv6.init(v);
 
-        stats.global_stats.icmpv6.rx_packets += 1;
+        stats.global_stats.icmpv6.rx_packets.inc();
 
         switch (h.type()) {
             header.ICMPv6EchoRequestType => {
-                stats.global_stats.icmpv6.rx_echo_requests += 1;
+                stats.global_stats.icmpv6.rx_echo_requests.inc();
                 handleEchoRequest(s, r, v);
             },
             header.ICMPv6EchoReplyType => {
-                stats.global_stats.icmpv6.rx_echo_replies += 1;
+                stats.global_stats.icmpv6.rx_echo_replies.inc();
             },
             header.ICMPv6NeighborSolicitationType => {
-                stats.global_stats.icmpv6.rx_neighbor_solicitations += 1;
+                stats.global_stats.icmpv6.rx_neighbor_solicitations.inc();
                 handleNeighborSolicitation(s, r, v);
             },
             header.ICMPv6NeighborAdvertisementType => {
-                stats.global_stats.icmpv6.rx_neighbor_advertisements += 1;
+                stats.global_stats.icmpv6.rx_neighbor_advertisements.inc();
                 handleNeighborAdvertisement(s, r, v);
             },
             header.ICMPv6RouterSolicitationType => {
-                stats.global_stats.icmpv6.rx_router_solicitations += 1;
+                stats.global_stats.icmpv6.rx_router_solicitations.inc();
             },
             header.ICMPv6RouterAdvertisementType => {
-                stats.global_stats.icmpv6.rx_router_advertisements += 1;
+                stats.global_stats.icmpv6.rx_router_advertisements.inc();
                 handleRouterAdvertisement(s, r, v);
             },
             130 => { // MLD Query
@@ -199,14 +199,14 @@ pub const ICMPv6PacketHandler = struct {
 
         const reply_route = r.*;
         if (r.nic.network_endpoints.get(0x86dd)) |ep| {
-            stats.global_stats.icmpv6.tx_echo_replies += 1;
+            stats.global_stats.icmpv6.tx_echo_replies.inc();
             ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
         }
     }
 
     fn handleNeighborSolicitation(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
         if (v.len < header.ICMPv6MinimumSize + 20) return;
-        const ns = header.ICMPv6NS.init(v[header.ICMPv6MinimumSize..]);
+        const ns = header.ICMPv6NS.init(@constCast(v[header.ICMPv6MinimumSize..]));
         const target = ns.targetAddress();
 
         const src_is_unspecified = r.remote_address.eq(.{ .v6 = [_]u8{0} ** 16 });
@@ -278,14 +278,14 @@ pub const ICMPv6PacketHandler = struct {
         };
 
         if (r.nic.network_endpoints.get(0x86dd)) |ep| {
-            stats.global_stats.icmpv6.tx_neighbor_advertisements += 1;
+            stats.global_stats.icmpv6.tx_neighbor_advertisements.inc();
             ep.writePacket(&na_route, ProtocolNumber, na_pkt) catch {};
         }
     }
 
-    fn handleNeighborAdvertisement(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
+    fn handleNeighborAdvertisement(s: *stack.Stack, _: *const stack.Route, v: []const u8) void {
         if (v.len < header.ICMPv6MinimumSize + 20) return;
-        const na = header.ICMPv6NA.init(v[header.ICMPv6MinimumSize..]);
+        const na = header.ICMPv6NA.init(@constCast(v[header.ICMPv6MinimumSize..]));
         const target = na.targetAddress();
 
         // Extract TLLA option
@@ -300,7 +300,7 @@ pub const ICMPv6PacketHandler = struct {
 
     fn handleRouterAdvertisement(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
         if (v.len < header.ICMPv6MinimumSize + 12) return;
-        const ra = header.ICMPv6RA.init(v[header.ICMPv6MinimumSize..]);
+        const ra = header.ICMPv6RA.init(@constCast(v[header.ICMPv6MinimumSize..]));
 
         // Add default gateway if lifetime > 0
         if (ra.routerLifetime() > 0) {
@@ -335,7 +335,7 @@ pub const ICMPv6PacketHandler = struct {
 
     fn handlePrefixOption(s: *stack.Stack, r: *const stack.Route, opt: []const u8) void {
         _ = s;
-        const pinfo = header.ICMPv6OptionPrefix.init(opt);
+        const pinfo = header.ICMPv6OptionPrefix.init(@constCast(opt));
         const prefix = pinfo.prefix();
         const prefix_len = pinfo.prefixLength();
 

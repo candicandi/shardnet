@@ -73,7 +73,7 @@ pub const TimerWheel = struct {
 
     pub fn init(allocator: std.mem.Allocator) !TimerWheel {
         // Create timerfd with CLOCK_MONOTONIC and non-blocking
-        const fd = std.posix.timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK) catch |err| {
+        const timer_fd = std.posix.timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK) catch |err| {
             // Fallback: use -1 to indicate timerfd unavailable
             if (err == error.SystemResources) return .{
                 .entries = std.ArrayList(*TimerEntry).init(allocator),
@@ -85,7 +85,7 @@ pub const TimerWheel = struct {
 
         return .{
             .entries = std.ArrayList(*TimerEntry).init(allocator),
-            .timer_fd = fd,
+            .timer_fd = timer_fd,
             .allocator = allocator,
         };
     }

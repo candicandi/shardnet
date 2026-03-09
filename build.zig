@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
     docs_lib.root_module.addImport("build_options", options_mod);
 
     const install_docs = b.addInstallDirectory(.{
-        .source = docs_lib.getEmittedDocs(),
+        .source_dir = docs_lib.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });

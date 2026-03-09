@@ -76,8 +76,8 @@ fn setupSignalHandlers() void {
         .mask = std.posix.empty_sigset,
         .flags = 0,
     };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null) catch {};
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null) catch {};
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
 fn printBanner() void {
@@ -166,7 +166,7 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     try s.registerNetworkProtocol(ipv6_proto.protocol());
 
     const arp_proto = try allocator.create(network.arp.ARPProtocol);
-    arp_proto.* = network.arp.ARPProtocol.init();
+    arp_proto.* = network.arp.ARPProtocol.init(allocator);
     try s.registerNetworkProtocol(arp_proto.protocol());
 
     const icmp_proto = try allocator.create(network.icmp.ICMPv4Protocol);

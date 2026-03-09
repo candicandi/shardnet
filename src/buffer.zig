@@ -88,7 +88,7 @@ pub const ClusterPool = struct {
             return c;
         }
 
-        stats.global_stats.pool.cluster_fallback += 1;
+        stats.global_stats.pool.cluster_fallback.inc();
         const c = try self.allocator.create(Cluster);
         c.* = .{
             .ref_count = 1,
@@ -168,10 +168,10 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn acquire(self: *Self) !*T {
-            if (self.free_list.popOrNull()) |node| {
+            if (self.free_list.pop()) |node| {
                 return node;
             }
-            stats.global_stats.pool.generic_fallback += 1;
+            stats.global_stats.pool.generic_fallback.inc();
             return try self.allocator.create(T);
         }
 
@@ -230,10 +230,10 @@ pub const BufferPool = struct {
     }
 
     pub fn acquire(self: *BufferPool) ![]u8 {
-        if (self.free_list.popOrNull()) |buf| {
+        if (self.free_list.pop()) |buf| {
             return buf;
         }
-        stats.global_stats.pool.buffer_fallback += 1;
+        stats.global_stats.pool.buffer_fallback.inc();
         return try self.allocator.alloc(u8, self.buffer_size);
     }
 
