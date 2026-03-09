@@ -288,7 +288,7 @@ pub const IPv4Endpoint = struct {
             mut_packets[i] = mut_pkt;
         }
 
-        stats.global_stats.ip.tx_packets += mut_packets.len;
+        stats.global_stats.ip.tx_packets.add(mut_packets.len);
         return self.nic.linkEP.writePackets(&mut_r, ProtocolNumber, mut_packets);
     }
 
@@ -308,11 +308,11 @@ pub const IPv4Endpoint = struct {
         const csum_calc = header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0));
         if (csum_calc != 0) {
             log.warn("IPv4: Checksum failure from {any} (Calculated: 0x{x}, Header: 0x{x})", .{ h.sourceAddress(), csum_calc, h.checksum() });
-            stats.global_stats.ip.dropped_packets += 1;
+            stats.global_stats.ip.dropped_packets.inc();
             return;
         }
 
-        stats.global_stats.ip.rx_packets += 1;
+        stats.global_stats.ip.rx_packets.inc();
 
         // Parse IP options if present
         if (hlen > header.IPv4MinimumSize) {
@@ -476,7 +476,7 @@ pub const IPv4Endpoint = struct {
         // NOTE: Would construct ICMP type 11 (Time Exceeded) code 0 (TTL expired in transit)
         // with first 8 bytes of original datagram as payload.
         // Rate limiting would apply here to prevent amplification.
-        stats.global_stats.ip.dropped_packets += 1;
+        stats.global_stats.ip.dropped_packets.inc();
     }
 };
 

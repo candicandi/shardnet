@@ -4,62 +4,69 @@ const std = @import("std");
 
 const Atomic = std.atomic.Value;
 
-// Atomic helpers
+/// Lock-free monotonic counter backed by an atomic u64.
+pub const Counter = struct {
+    raw: Atomic(u64) = Atomic(u64).init(0),
 
-fn atomicInc(counter: *Atomic(u64)) void {
-    _ = counter.fetchAdd(1, .monotonic);
-}
-
-fn atomicAdd(counter: *Atomic(u64), value: u64) void {
-    _ = counter.fetchAdd(value, .monotonic);
-}
-
-fn atomicLoad(counter: *const Atomic(u64)) u64 {
-    return counter.load(.monotonic);
-}
-
-fn atomicStore(counter: *Atomic(u64), value: u64) void {
-    counter.store(value, .monotonic);
-}
-
-// Direction counters (atomic, lock-free)
-pub const DirectionStats = struct {
-    rx_bytes: Atomic(u64) = Atomic(u64).init(0),
-    tx_bytes: Atomic(u64) = Atomic(u64).init(0),
-    rx_packets: Atomic(u64) = Atomic(u64).init(0),
-    tx_packets: Atomic(u64) = Atomic(u64).init(0),
-    rx_drops: Atomic(u64) = Atomic(u64).init(0),
-    tx_drops: Atomic(u64) = Atomic(u64).init(0),
-
-    pub fn recordRx(self: *DirectionStats, bytes: u64) void {
-        atomicInc(&self.rx_packets);
-        atomicAdd(&self.rx_bytes, bytes);
+    pub fn inc(self: *Counter) void {
+        _ = self.raw.fetchAdd(1, .monotonic);
     }
 
-    pub fn recordTx(self: *DirectionStats, bytes: u64) void {
-        atomicInc(&self.tx_packets);
-        atomicAdd(&self.tx_bytes, bytes);
+    pub fn dec(self: *Counter) void {
+        _ = self.raw.fetchSub(1, .monotonic);
     }
 
-    pub fn recordRxDrop(self: *DirectionStats) void {
-        atomicInc(&self.rx_drops);
+    pub fn add(self: *Counter, value: u64) void {
+        _ = self.raw.fetchAdd(value, .monotonic);
     }
 
-    pub fn recordTxDrop(self: *DirectionStats) void {
-        atomicInc(&self.tx_drops);
+    pub fn load(self: *const Counter) u64 {
+        return self.raw.load(.monotonic);
     }
 
-    pub fn reset(self: *DirectionStats) void {
-        atomicStore(&self.rx_bytes, 0);
-        atomicStore(&self.tx_bytes, 0);
-        atomicStore(&self.rx_packets, 0);
-        atomicStore(&self.tx_packets, 0);
-        atomicStore(&self.rx_drops, 0);
-        atomicStore(&self.tx_drops, 0);
+    pub fn store(self: *Counter, value: u64) void {
+        self.raw.store(value, .monotonic);
     }
 };
 
-// Snapshot — immutable copy for logging or export
+// Direction counters (atomic, lock-free)
+pub const DirectionStats = struct {
+    rx_bytes: Counter = .{},
+    tx_bytes: Counter = .{},
+    rx_packets: Counter = .{},
+    tx_packets: Counter = .{},
+    rx_drops: Counter = .{},
+    tx_drops: Counter = .{},
+
+    pub fn recordRx(self: *DirectionStats, bytes: u64) void {
+        self.rx_packets.inc();
+        self.rx_bytes.add(bytes);
+    }
+
+    pub fn recordTx(self: *DirectionStats, bytes: u64) void {
+        self.tx_packets.inc();
+        self.tx_bytes.add(bytes);
+    }
+
+    pub fn recordRxDrop(self: *DirectionStats) void {
+        self.rx_drops.inc();
+    }
+
+    pub fn recordTxDrop(self: *DirectionStats) void {
+        self.tx_drops.inc();
+    }
+
+    pub fn reset(self: *DirectionStats) void {
+        self.rx_bytes.store(0);
+        self.tx_bytes.store(0);
+        self.rx_packets.store(0);
+        self.tx_packets.store(0);
+        self.rx_drops.store(0);
+        self.tx_drops.store(0);
+    }
+};
+
+// Snapshot -- immutable copy for logging or export
 pub const Snapshot = struct {
     ip: IPStatsSnapshot,
     tcp: TCPStatsSnapshot,
@@ -117,176 +124,204 @@ pub const LinkStatsSnapshot = struct {
 // Protocol-level stats (atomic)
 
 pub const IPStats = struct {
-    rx_packets: Atomic(u64) = Atomic(u64).init(0),
-    tx_packets: Atomic(u64) = Atomic(u64).init(0),
-    dropped_packets: Atomic(u64) = Atomic(u64).init(0),
-    invalid_checksum: Atomic(u64) = Atomic(u64).init(0),
-    no_route: Atomic(u64) = Atomic(u64).init(0),
+    rx_packets: Counter = .{},
+    tx_packets: Counter = .{},
+    dropped_packets: Counter = .{},
+    invalid_checksum: Counter = .{},
+    no_route: Counter = .{},
 
     pub fn snapshot(self: *const IPStats) IPStatsSnapshot {
         return .{
-            .rx_packets = atomicLoad(&self.rx_packets),
-            .tx_packets = atomicLoad(&self.tx_packets),
-            .dropped_packets = atomicLoad(&self.dropped_packets),
-            .invalid_checksum = atomicLoad(&self.invalid_checksum),
-            .no_route = atomicLoad(&self.no_route),
+            .rx_packets = self.rx_packets.load(),
+            .tx_packets = self.tx_packets.load(),
+            .dropped_packets = self.dropped_packets.load(),
+            .invalid_checksum = self.invalid_checksum.load(),
+            .no_route = self.no_route.load(),
         };
     }
 
     pub fn reset(self: *IPStats) void {
-        atomicStore(&self.rx_packets, 0);
-        atomicStore(&self.tx_packets, 0);
-        atomicStore(&self.dropped_packets, 0);
-        atomicStore(&self.invalid_checksum, 0);
-        atomicStore(&self.no_route, 0);
+        self.rx_packets.store(0);
+        self.tx_packets.store(0);
+        self.dropped_packets.store(0);
+        self.invalid_checksum.store(0);
+        self.no_route.store(0);
     }
 };
 
 pub const TCPStats = struct {
-    rx_segments: Atomic(u64) = Atomic(u64).init(0),
-    tx_segments: Atomic(u64) = Atomic(u64).init(0),
-    retransmits: Atomic(u64) = Atomic(u64).init(0),
-    active_opens: Atomic(u64) = Atomic(u64).init(0),
-    passive_opens: Atomic(u64) = Atomic(u64).init(0),
-    failed_connections: Atomic(u64) = Atomic(u64).init(0),
-    established: Atomic(u64) = Atomic(u64).init(0),
-    resets_sent: Atomic(u64) = Atomic(u64).init(0),
-    resets_received: Atomic(u64) = Atomic(u64).init(0),
-    active_endpoints: Atomic(u64) = Atomic(u64).init(0),
-    pool_exhausted: Atomic(u64) = Atomic(u64).init(0),
-    syncache_dropped: Atomic(u64) = Atomic(u64).init(0),
-    syncache_searches: Atomic(u64) = Atomic(u64).init(0),
-    syncache_max_size: Atomic(u64) = Atomic(u64).init(0),
+    rx_segments: Counter = .{},
+    tx_segments: Counter = .{},
+    retransmits: Counter = .{},
+    active_opens: Counter = .{},
+    passive_opens: Counter = .{},
+    failed_connections: Counter = .{},
+    established: Counter = .{},
+    resets_sent: Counter = .{},
+    resets_received: Counter = .{},
+    active_endpoints: Counter = .{},
+    pool_exhausted: Counter = .{},
+    syncache_dropped: Counter = .{},
+    syncache_searches: Counter = .{},
+    syncache_max_size: Counter = .{},
 
     // TCP flags stats.
-    rx_syn: Atomic(u64) = Atomic(u64).init(0),
-    rx_syn_ack: Atomic(u64) = Atomic(u64).init(0),
-    rx_ack: Atomic(u64) = Atomic(u64).init(0),
-    rx_psh: Atomic(u64) = Atomic(u64).init(0),
-    rx_fin: Atomic(u64) = Atomic(u64).init(0),
-    tx_syn: Atomic(u64) = Atomic(u64).init(0),
-    tx_syn_ack: Atomic(u64) = Atomic(u64).init(0),
-    tx_ack: Atomic(u64) = Atomic(u64).init(0),
-    tx_psh: Atomic(u64) = Atomic(u64).init(0),
-    tx_fin: Atomic(u64) = Atomic(u64).init(0),
+    rx_syn: Counter = .{},
+    rx_syn_ack: Counter = .{},
+    rx_ack: Counter = .{},
+    rx_psh: Counter = .{},
+    rx_fin: Counter = .{},
+    tx_syn: Counter = .{},
+    tx_syn_ack: Counter = .{},
+    tx_ack: Counter = .{},
+    tx_psh: Counter = .{},
+    tx_fin: Counter = .{},
 
     // Keepalive and recovery stats
-    tx_keepalive_probes: Atomic(u64) = Atomic(u64).init(0),
-    prr_recovery_entries: Atomic(u64) = Atomic(u64).init(0),
-    early_retransmits: Atomic(u64) = Atomic(u64).init(0),
+    tx_keepalive_probes: Counter = .{},
+    prr_recovery_entries: Counter = .{},
+    early_retransmits: Counter = .{},
 
     pub fn snapshot(self: *const TCPStats) TCPStatsSnapshot {
         return .{
-            .rx_segments = atomicLoad(&self.rx_segments),
-            .tx_segments = atomicLoad(&self.tx_segments),
-            .retransmits = atomicLoad(&self.retransmits),
-            .active_opens = atomicLoad(&self.active_opens),
-            .passive_opens = atomicLoad(&self.passive_opens),
-            .failed_connections = atomicLoad(&self.failed_connections),
-            .established = atomicLoad(&self.established),
-            .resets_sent = atomicLoad(&self.resets_sent),
-            .resets_received = atomicLoad(&self.resets_received),
-            .active_endpoints = atomicLoad(&self.active_endpoints),
+            .rx_segments = self.rx_segments.load(),
+            .tx_segments = self.tx_segments.load(),
+            .retransmits = self.retransmits.load(),
+            .active_opens = self.active_opens.load(),
+            .passive_opens = self.passive_opens.load(),
+            .failed_connections = self.failed_connections.load(),
+            .established = self.established.load(),
+            .resets_sent = self.resets_sent.load(),
+            .resets_received = self.resets_received.load(),
+            .active_endpoints = self.active_endpoints.load(),
         };
     }
 
     pub fn reset(self: *TCPStats) void {
-        atomicStore(&self.rx_segments, 0);
-        atomicStore(&self.tx_segments, 0);
-        atomicStore(&self.retransmits, 0);
-        atomicStore(&self.active_opens, 0);
-        atomicStore(&self.passive_opens, 0);
-        atomicStore(&self.failed_connections, 0);
-        atomicStore(&self.established, 0);
-        atomicStore(&self.resets_sent, 0);
-        atomicStore(&self.resets_received, 0);
-        atomicStore(&self.active_endpoints, 0);
-        atomicStore(&self.pool_exhausted, 0);
-        atomicStore(&self.syncache_dropped, 0);
-        atomicStore(&self.syncache_searches, 0);
-        atomicStore(&self.syncache_max_size, 0);
-        atomicStore(&self.rx_syn, 0);
-        atomicStore(&self.rx_syn_ack, 0);
-        atomicStore(&self.rx_ack, 0);
-        atomicStore(&self.rx_psh, 0);
-        atomicStore(&self.rx_fin, 0);
-        atomicStore(&self.tx_syn, 0);
-        atomicStore(&self.tx_syn_ack, 0);
-        atomicStore(&self.tx_ack, 0);
-        atomicStore(&self.tx_psh, 0);
-        atomicStore(&self.tx_fin, 0);
+        self.rx_segments.store(0);
+        self.tx_segments.store(0);
+        self.retransmits.store(0);
+        self.active_opens.store(0);
+        self.passive_opens.store(0);
+        self.failed_connections.store(0);
+        self.established.store(0);
+        self.resets_sent.store(0);
+        self.resets_received.store(0);
+        self.active_endpoints.store(0);
+        self.pool_exhausted.store(0);
+        self.syncache_dropped.store(0);
+        self.syncache_searches.store(0);
+        self.syncache_max_size.store(0);
+        self.rx_syn.store(0);
+        self.rx_syn_ack.store(0);
+        self.rx_ack.store(0);
+        self.rx_psh.store(0);
+        self.rx_fin.store(0);
+        self.tx_syn.store(0);
+        self.tx_syn_ack.store(0);
+        self.tx_ack.store(0);
+        self.tx_psh.store(0);
+        self.tx_fin.store(0);
     }
 };
 
 pub const ARPStats = struct {
-    rx_requests: Atomic(u64) = Atomic(u64).init(0),
-    rx_replies: Atomic(u64) = Atomic(u64).init(0),
-    tx_requests: Atomic(u64) = Atomic(u64).init(0),
-    tx_replies: Atomic(u64) = Atomic(u64).init(0),
+    rx_requests: Counter = .{},
+    rx_replies: Counter = .{},
+    tx_requests: Counter = .{},
+    tx_replies: Counter = .{},
 
     pub fn snapshot(self: *const ARPStats) ARPStatsSnapshot {
         return .{
-            .rx_requests = atomicLoad(&self.rx_requests),
-            .rx_replies = atomicLoad(&self.rx_replies),
-            .tx_requests = atomicLoad(&self.tx_requests),
-            .tx_replies = atomicLoad(&self.tx_replies),
+            .rx_requests = self.rx_requests.load(),
+            .rx_replies = self.rx_replies.load(),
+            .tx_requests = self.tx_requests.load(),
+            .tx_replies = self.tx_replies.load(),
         };
     }
 
     pub fn reset(self: *ARPStats) void {
-        atomicStore(&self.rx_requests, 0);
-        atomicStore(&self.rx_replies, 0);
-        atomicStore(&self.tx_requests, 0);
-        atomicStore(&self.tx_replies, 0);
+        self.rx_requests.store(0);
+        self.rx_replies.store(0);
+        self.tx_requests.store(0);
+        self.tx_replies.store(0);
     }
 };
 
 pub const PoolStats = struct {
-    cluster_fallback: Atomic(u64) = Atomic(u64).init(0),
-    buffer_fallback: Atomic(u64) = Atomic(u64).init(0),
-    generic_fallback: Atomic(u64) = Atomic(u64).init(0),
-    cluster_exhausted: Atomic(u64) = Atomic(u64).init(0),
-    view_exhausted: Atomic(u64) = Atomic(u64).init(0),
+    cluster_fallback: Counter = .{},
+    buffer_fallback: Counter = .{},
+    generic_fallback: Counter = .{},
+    cluster_exhausted: Counter = .{},
+    view_exhausted: Counter = .{},
 
     pub fn reset(self: *PoolStats) void {
-        atomicStore(&self.cluster_fallback, 0);
-        atomicStore(&self.buffer_fallback, 0);
-        atomicStore(&self.generic_fallback, 0);
-        atomicStore(&self.cluster_exhausted, 0);
-        atomicStore(&self.view_exhausted, 0);
+        self.cluster_fallback.store(0);
+        self.buffer_fallback.store(0);
+        self.generic_fallback.store(0);
+        self.cluster_exhausted.store(0);
+        self.view_exhausted.store(0);
     }
 };
 
+pub const ICMPStats = struct {
+    rx_packets: Counter = .{},
+    rx_echo_requests: Counter = .{},
+    rx_echo_replies: Counter = .{},
+    tx_echo_replies: Counter = .{},
+    tx_dest_unreachable: Counter = .{},
+    tx_time_exceeded: Counter = .{},
+};
+
+pub const ICMPv6Stats = struct {
+    rx_packets: Counter = .{},
+    rx_echo_requests: Counter = .{},
+    rx_echo_replies: Counter = .{},
+    tx_echo_replies: Counter = .{},
+    rx_neighbor_solicitations: Counter = .{},
+    rx_neighbor_advertisements: Counter = .{},
+    rx_router_solicitations: Counter = .{},
+    rx_router_advertisements: Counter = .{},
+    tx_neighbor_advertisements: Counter = .{},
+};
+
+pub const UDPStats = struct {
+    rx_packets: Counter = .{},
+    tx_packets: Counter = .{},
+    rx_bytes: Counter = .{},
+    tx_bytes: Counter = .{},
+};
+
 pub const LinkStats = struct {
-    rx_packets: Atomic(u64) = Atomic(u64).init(0),
-    tx_packets: Atomic(u64) = Atomic(u64).init(0),
-    rx_bytes: Atomic(u64) = Atomic(u64).init(0),
-    tx_bytes: Atomic(u64) = Atomic(u64).init(0),
-    rx_errors: Atomic(u64) = Atomic(u64).init(0),
-    tx_errors: Atomic(u64) = Atomic(u64).init(0),
-    rx_syscalls: Atomic(u64) = Atomic(u64).init(0),
-    tx_syscalls: Atomic(u64) = Atomic(u64).init(0),
+    rx_packets: Counter = .{},
+    tx_packets: Counter = .{},
+    rx_bytes: Counter = .{},
+    tx_bytes: Counter = .{},
+    rx_errors: Counter = .{},
+    tx_errors: Counter = .{},
+    rx_syscalls: Counter = .{},
+    tx_syscalls: Counter = .{},
 
     pub fn snapshot(self: *const LinkStats) LinkStatsSnapshot {
         return .{
-            .rx_packets = atomicLoad(&self.rx_packets),
-            .tx_packets = atomicLoad(&self.tx_packets),
-            .rx_bytes = atomicLoad(&self.rx_bytes),
-            .tx_bytes = atomicLoad(&self.tx_bytes),
-            .rx_errors = atomicLoad(&self.rx_errors),
-            .tx_errors = atomicLoad(&self.tx_errors),
+            .rx_packets = self.rx_packets.load(),
+            .tx_packets = self.tx_packets.load(),
+            .rx_bytes = self.rx_bytes.load(),
+            .tx_bytes = self.tx_bytes.load(),
+            .rx_errors = self.rx_errors.load(),
+            .tx_errors = self.tx_errors.load(),
         };
     }
 
     pub fn reset(self: *LinkStats) void {
-        atomicStore(&self.rx_packets, 0);
-        atomicStore(&self.tx_packets, 0);
-        atomicStore(&self.rx_bytes, 0);
-        atomicStore(&self.tx_bytes, 0);
-        atomicStore(&self.rx_errors, 0);
-        atomicStore(&self.tx_errors, 0);
-        atomicStore(&self.rx_syscalls, 0);
-        atomicStore(&self.tx_syscalls, 0);
+        self.rx_packets.store(0);
+        self.tx_packets.store(0);
+        self.rx_bytes.store(0);
+        self.tx_bytes.store(0);
+        self.rx_errors.store(0);
+        self.tx_errors.store(0);
+        self.rx_syscalls.store(0);
+        self.tx_syscalls.store(0);
     }
 
     pub fn dump(self: *const LinkStats) void {
@@ -353,6 +388,9 @@ pub const StackStats = struct {
     ip: IPStats = .{},
     tcp: TCPStats = .{},
     arp: ARPStats = .{},
+    icmp: ICMPStats = .{},
+    icmpv6: ICMPv6Stats = .{},
+    udp: UDPStats = .{},
     latency: LatencyStats = .{},
     pool: PoolStats = .{},
     direction: DirectionStats = .{},
@@ -372,12 +410,12 @@ pub const StackStats = struct {
                 .tx_errors = 0,
             },
             .direction = .{
-                .rx_bytes = atomicLoad(&self.direction.rx_bytes),
-                .tx_bytes = atomicLoad(&self.direction.tx_bytes),
-                .rx_packets = atomicLoad(&self.direction.rx_packets),
-                .tx_packets = atomicLoad(&self.direction.tx_packets),
-                .rx_drops = atomicLoad(&self.direction.rx_drops),
-                .tx_drops = atomicLoad(&self.direction.tx_drops),
+                .rx_bytes = self.direction.rx_bytes.load(),
+                .tx_bytes = self.direction.tx_bytes.load(),
+                .rx_packets = self.direction.rx_packets.load(),
+                .tx_packets = self.direction.tx_packets.load(),
+                .rx_drops = self.direction.rx_drops.load(),
+                .tx_drops = self.direction.tx_drops.load(),
             },
         };
     }

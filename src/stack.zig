@@ -684,13 +684,18 @@ pub const Stack = struct {
 
         while (self.running.load(.acquire)) {
             // Process timers
-            self.timer_queue.processExpired();
+            _ = self.timer_queue.tick();
 
             // Expire old ARP pending entries
             _ = self.arp_pending.expireOld(std.time.milliTimestamp());
 
-            // Yield to other threads
-            std.time.sleep(1_000_000); // 1ms
+            // Sleep until next timer or 10ms max (avoids busy-wait while
+            // staying responsive to shutdown and new events).
+            const sleep_ns: u64 = if (self.timer_queue.nextExpiration()) |ticks|
+                @min(ticks * std.time.ns_per_ms, 10 * std.time.ns_per_ms)
+            else
+                10 * std.time.ns_per_ms;
+            std.time.sleep(sleep_ns);
         }
     }
 
@@ -716,19 +721,18 @@ pub const Stack = struct {
             tcp_conn_count += shard.count();
         }
 
-        // Get global stats
-        const global = stats.global_stats;
+        const link = &stats.global_link_stats;
 
         return .{
             .uptime_seconds = uptime_sec,
             .nic_count = self.nics.count(),
             .tcp_connections = tcp_conn_count,
             .arp_cache_size = self.link_addr_cache.count(),
-            .rx_packets = global.link.rx_packets.load(.monotonic),
-            .tx_packets = global.link.tx_packets.load(.monotonic),
-            .rx_bytes = global.link.rx_bytes.load(.monotonic),
-            .tx_bytes = global.link.tx_bytes.load(.monotonic),
-            .rx_drops = global.link.rx_drops.load(.monotonic),
+            .rx_packets = link.rx_packets.load(),
+            .tx_packets = link.tx_packets.load(),
+            .rx_bytes = link.rx_bytes.load(),
+            .tx_bytes = link.tx_bytes.load(),
+            .rx_drops = stats.global_stats.direction.rx_drops.load(),
         };
     }
 

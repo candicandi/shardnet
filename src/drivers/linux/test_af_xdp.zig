@@ -325,10 +325,10 @@ test "AfXdp stats counters increment correctly" {
     // Reset global counters to a known baseline.
     stats.global_stats.direction.reset();
 
-    const before_rx = stats.global_stats.direction.rx_packets.load(.monotonic);
-    const before_tx = stats.global_stats.direction.tx_packets.load(.monotonic);
-    const before_rx_bytes = stats.global_stats.direction.rx_bytes.load(.monotonic);
-    const before_tx_bytes = stats.global_stats.direction.tx_bytes.load(.monotonic);
+    const before_rx = stats.global_stats.direction.rx_packets.load();
+    const before_tx = stats.global_stats.direction.tx_packets.load();
+    const before_rx_bytes = stats.global_stats.direction.rx_bytes.load();
+    const before_tx_bytes = stats.global_stats.direction.tx_bytes.load();
 
     try std.testing.expectEqual(@as(u64, 0), before_rx);
     try std.testing.expectEqual(@as(u64, 0), before_tx);
@@ -350,20 +350,20 @@ test "AfXdp stats counters increment correctly" {
     }
 
     // Verify packet counters.
-    const after_rx = stats.global_stats.direction.rx_packets.load(.monotonic);
-    const after_tx = stats.global_stats.direction.tx_packets.load(.monotonic);
+    const after_rx = stats.global_stats.direction.rx_packets.load();
+    const after_tx = stats.global_stats.direction.tx_packets.load();
     try std.testing.expectEqual(rx_count, after_rx);
     try std.testing.expectEqual(tx_count, after_tx);
 
     // Verify byte counters.
-    const after_rx_bytes = stats.global_stats.direction.rx_bytes.load(.monotonic);
-    const after_tx_bytes = stats.global_stats.direction.tx_bytes.load(.monotonic);
+    const after_rx_bytes = stats.global_stats.direction.rx_bytes.load();
+    const after_tx_bytes = stats.global_stats.direction.tx_bytes.load();
     try std.testing.expectEqual(rx_count * rx_pkt_size, after_rx_bytes);
     try std.testing.expectEqual(tx_count * tx_pkt_size, after_tx_bytes);
 
     // Verify drop counters are still zero (we recorded no drops).
-    const rx_drops = stats.global_stats.direction.rx_drops.load(.monotonic);
-    const tx_drops = stats.global_stats.direction.tx_drops.load(.monotonic);
+    const rx_drops = stats.global_stats.direction.rx_drops.load();
+    const tx_drops = stats.global_stats.direction.tx_drops.load();
     try std.testing.expectEqual(@as(u64, 0), rx_drops);
     try std.testing.expectEqual(@as(u64, 0), tx_drops);
 
@@ -372,8 +372,8 @@ test "AfXdp stats counters increment correctly" {
     stats.global_stats.direction.recordRxDrop();
     stats.global_stats.direction.recordTxDrop();
 
-    try std.testing.expectEqual(@as(u64, 2), stats.global_stats.direction.rx_drops.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), stats.global_stats.direction.tx_drops.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), stats.global_stats.direction.rx_drops.load());
+    try std.testing.expectEqual(@as(u64, 1), stats.global_stats.direction.tx_drops.load());
 
     // Verify the snapshot API captures the same values.
     const snap = stats.global_stats.snapshot();
@@ -394,13 +394,13 @@ test "AfXdp stats counters increment correctly" {
 test "AfXdp link-level stats counters" {
     stats.global_link_stats.reset();
 
-    // Manually bump counters via atomic helpers (mirrors what a driver does).
-    _ = stats.global_link_stats.rx_packets.fetchAdd(7, .monotonic);
-    _ = stats.global_link_stats.tx_packets.fetchAdd(3, .monotonic);
-    _ = stats.global_link_stats.rx_bytes.fetchAdd(7 * 1500, .monotonic);
-    _ = stats.global_link_stats.tx_bytes.fetchAdd(3 * 800, .monotonic);
-    _ = stats.global_link_stats.rx_errors.fetchAdd(1, .monotonic);
-    _ = stats.global_link_stats.tx_errors.fetchAdd(0, .monotonic);
+    // Manually bump counters (mirrors what a driver does).
+    stats.global_link_stats.rx_packets.add(7);
+    stats.global_link_stats.tx_packets.add(3);
+    stats.global_link_stats.rx_bytes.add(7 * 1500);
+    stats.global_link_stats.tx_bytes.add(3 * 800);
+    stats.global_link_stats.rx_errors.inc();
+    stats.global_link_stats.tx_errors.add(0);
 
     const snap = stats.global_link_stats.snapshot();
     try std.testing.expectEqual(@as(u64, 7), snap.rx_packets);

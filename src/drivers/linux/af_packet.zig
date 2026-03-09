@@ -411,7 +411,7 @@ pub const AfPacket = struct {
         _ = std.os.linux.syscall6(.sendto, @as(usize, @intCast(self.fd)), 0, 0, 0, 0, 0);
         const end = std.time.nanoTimestamp();
         stats.global_stats.latency.driver_tx.record(@as(i64, @intCast(end - start)));
-        _ = stats.global_link_stats.tx_syscalls.fetchAdd(1, .monotonic);
+        stats.global_link_stats.tx_syscalls.inc();
     }
 
     fn close_external(ptr: *anyopaque) void {
@@ -468,7 +468,7 @@ pub const AfPacket = struct {
                 self.flush();
                 if (h.tp_status != header.TP_STATUS_KERNEL) {
                     // error: ring still full after flush — caller should back off.
-                    _ = stats.global_link_stats.tx_errors.fetchAdd(1, .monotonic);
+                    stats.global_link_stats.tx_errors.inc();
                     stats.global_stats.direction.recordTxDrop();
                     return tcpip.Error.WouldBlock;
                 }
@@ -481,7 +481,7 @@ pub const AfPacket = struct {
             const total_len = hdr_view.len + pkt.data.size;
             if (total_len + data_off > self.tx_frame_size) {
                 // error: assembled packet exceeds the TX frame size.
-                _ = stats.global_link_stats.tx_errors.fetchAdd(1, .monotonic);
+                stats.global_link_stats.tx_errors.inc();
                 return tcpip.Error.MessageTooLong;
             }
 
@@ -499,8 +499,8 @@ pub const AfPacket = struct {
             h.tp_status = header.TP_STATUS_SEND_REQUEST;
 
             // -- Stats --
-            _ = stats.global_link_stats.tx_packets.fetchAdd(1, .monotonic);
-            _ = stats.global_link_stats.tx_bytes.fetchAdd(total_len, .monotonic);
+            stats.global_link_stats.tx_packets.inc();
+            stats.global_link_stats.tx_bytes.add(total_len);
             stats.global_stats.direction.recordTx(total_len);
 
             self.tx_idx = (self.tx_idx + 1) % self.tx_frame_nr;
@@ -589,7 +589,7 @@ pub const AfPacket = struct {
             while (pkt_i < num_pkts and num_read < max_batch) : (pkt_i += 1) {
                 if (pkt_offset + @sizeOf(tpacket3_hdr) > self.rx_block_size) {
                     // error: packet header overflows the block — corrupted ring.
-                    _ = stats.global_link_stats.rx_errors.fetchAdd(1, .monotonic);
+                    stats.global_link_stats.rx_errors.inc();
                     break;
                 }
 
@@ -600,7 +600,7 @@ pub const AfPacket = struct {
                 const mac_off: usize = tp3.tp_mac;
                 if (mac_off + snap_len > self.rx_block_size - pkt_offset) {
                     // error: frame data overflows the block — skip this packet.
-                    _ = stats.global_link_stats.rx_errors.fetchAdd(1, .monotonic);
+                    stats.global_link_stats.rx_errors.inc();
                     if (tp3.tp_next_offset == 0) break;
                     pkt_offset += tp3.tp_next_offset;
                     continue;
@@ -618,7 +618,7 @@ pub const AfPacket = struct {
                 // -- Acquire a cluster and copy the frame -------------------
                 const c = self.cluster_pool.acquire() catch {
                     // error: cluster pool exhausted — drop the packet.
-                    stats.global_stats.pool.cluster_exhausted += 1;
+                    stats.global_stats.pool.cluster_exhausted.inc();
                     stats.global_stats.direction.recordRxDrop();
                     return num_read > 0;
                 };
@@ -632,13 +632,13 @@ pub const AfPacket = struct {
                 };
 
                 // -- Stats --
-                _ = stats.global_link_stats.rx_packets.fetchAdd(1, .monotonic);
-                _ = stats.global_link_stats.rx_bytes.fetchAdd(snap_len, .monotonic);
+                stats.global_link_stats.rx_packets.inc();
+                stats.global_link_stats.rx_bytes.add(snap_len);
                 stats.global_stats.direction.recordRx(snap_len);
 
                 const view_mem = self.view_pool.acquire() catch {
                     // error: view pool exhausted — clean up and bail.
-                    stats.global_stats.pool.view_exhausted += 1;
+                    stats.global_stats.pool.view_exhausted.inc();
                     self.header_pool.release(h_buf);
                     c.release();
                     stats.global_stats.direction.recordRxDrop();

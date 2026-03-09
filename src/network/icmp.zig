@@ -60,14 +60,11 @@ pub const RateLimiter = struct {
     /// Tokens refilled per second.
     refill_rate: u32 = 100,
     /// Last refill timestamp (ms) - monotonic clock, not wall time.
+    /// Zero means "not yet initialised"; refill() lazy-inits on first call.
     last_refill_ms: i64 = 0,
 
     pub fn init() RateLimiter {
-        return .{
-            // NOTE: milliTimestamp() returns monotonic time, so rate limiting
-            // continues to work correctly across NTP adjustments or DST changes.
-            .last_refill_ms = std.time.milliTimestamp(),
-        };
+        return .{};
     }
 
     /// Try to consume a token. Returns true if allowed.
@@ -83,6 +80,12 @@ pub const RateLimiter = struct {
     /// Refill tokens based on elapsed monotonic time.
     fn refill(self: *RateLimiter) void {
         const now = std.time.milliTimestamp();
+        // Lazy-init: milliTimestamp() cannot be called at comptime, so
+        // the first refill() seeds the clock instead.
+        if (self.last_refill_ms == 0) {
+            self.last_refill_ms = now;
+            return;
+        }
         const elapsed_ms = now - self.last_refill_ms;
         if (elapsed_ms >= 1000) {
             const new_tokens = @as(u32, @intCast(@divFloor(elapsed_ms * self.refill_rate, 1000)));
@@ -179,15 +182,15 @@ pub const ICMPv4PacketHandler = struct {
         const v = mut_pkt.data.first() orelse return;
         const h = header.ICMPv4.init(v);
 
-        stats.global_stats.icmp.rx_packets += 1;
+        stats.global_stats.icmp.rx_packets.inc();
 
         switch (h.@"type"()) {
             Type.ECHO => {
-                stats.global_stats.icmp.rx_echo_requests += 1;
+                stats.global_stats.icmp.rx_echo_requests.inc();
                 handleEchoRequest(s, r, &mut_pkt, v);
             },
             Type.ECHO_REPLY => {
-                stats.global_stats.icmp.rx_echo_replies += 1;
+                stats.global_stats.icmp.rx_echo_replies.inc();
                 // RTT measurement would be handled here
             },
             Type.DEST_UNREACHABLE => {
@@ -228,7 +231,7 @@ pub const ICMPv4PacketHandler = struct {
 
         const reply_route = r.*;
         if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
-            stats.global_stats.icmp.tx_echo_replies += 1;
+            stats.global_stats.icmp.tx_echo_replies.inc();
             ip_ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
         }
     }
@@ -292,7 +295,7 @@ pub const ICMPv4PacketHandler = struct {
         };
 
         if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
-            stats.global_stats.icmp.tx_dest_unreachable += 1;
+            stats.global_stats.icmp.tx_dest_unreachable.inc();
             ip_ep.writePacket(r, ProtocolNumber, pkt) catch {};
         }
     }
@@ -331,7 +334,7 @@ pub const ICMPv4PacketHandler = struct {
         };
 
         if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
-            stats.global_stats.icmp.tx_time_exceeded += 1;
+            stats.global_stats.icmp.tx_time_exceeded.inc();
             ip_ep.writePacket(r, ProtocolNumber, pkt) catch {};
         }
     }

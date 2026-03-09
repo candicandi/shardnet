@@ -252,7 +252,7 @@ pub const ARPProtocol = struct {
                     .nic = nic,
                 };
 
-                stats.global_stats.arp.tx_requests += 1;
+                stats.global_stats.arp.tx_requests.inc();
                 return nic.linkEP.writePacket(&r, ProtocolNumber, pb);
             }
         }
@@ -435,7 +435,7 @@ pub const ARPEndpoint = struct {
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
-            stats.global_stats.arp.rx_requests += 1;
+            stats.global_stats.arp.rx_requests.inc();
             if (self.nic.hasAddress(target_proto_addr)) {
                 const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
@@ -465,11 +465,11 @@ pub const ARPEndpoint = struct {
                     .nic = self.nic,
                 };
 
-                stats.global_stats.arp.tx_replies += 1;
+                stats.global_stats.arp.tx_replies.inc();
                 self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
             }
         } else if (h.op() == 2) { // Reply
-            stats.global_stats.arp.rx_replies += 1;
+            stats.global_stats.arp.rx_replies.inc();
         }
     }
 };
