@@ -26,14 +26,14 @@ pub const SocketOptions = struct {
 pub const UDPProtocol = struct {
     view_pool: buffer.BufferPool,
     header_pool: buffer.BufferPool,
-    packet_node_pool: buffer.Pool(std.TailQueue(UDPEndpoint.Packet).Node),
+    packet_node_pool: buffer.Pool(std.DoublyLinkedList(UDPEndpoint.Packet).Node),
 
     pub fn init(allocator: std.mem.Allocator) *UDPProtocol {
         const self = allocator.create(UDPProtocol) catch unreachable;
         self.* = .{
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 131072),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 131072),
-            .packet_node_pool = buffer.Pool(std.TailQueue(UDPEndpoint.Packet).Node).init(allocator, 131072),
+            .packet_node_pool = buffer.Pool(std.DoublyLinkedList(UDPEndpoint.Packet).Node).init(allocator, 131072),
         };
         return self;
     }
@@ -95,7 +95,7 @@ pub const UDPEndpoint = struct {
     stack: *stack.Stack,
     proto: *UDPProtocol,
     waiter_queue: *waiter.Queue,
-    rcv_list: std.TailQueue(Packet),
+    rcv_list: std.DoublyLinkedList(Packet),
     ref_count: usize = 1,
     retry_timer: @import("../time.zig").Timer = undefined,
 
@@ -210,14 +210,7 @@ pub const UDPEndpoint = struct {
 
     /// Calculate UDP checksum with optional hardware offload.
     fn calculateChecksum(self: *UDPEndpoint, h: *header.UDP, local_addr: tcpip.Address, remote_addr: tcpip.Address, data: buffer.VectorisedView) u16 {
-        // Check if hardware offload is available and enabled
-        if (self.options.hw_checksum_offload) {
-            const caps = self.stack.getLinkCapabilities();
-            if (caps.tx_checksum_offload) {
-                // Hardware will calculate checksum; return 0 as placeholder
-                return 0;
-            }
-        }
+        // TODO: hardware checksum offload (needs capability query on NIC)
 
         // Software checksum calculation
         var sum: u32 = 0;
@@ -295,8 +288,8 @@ pub const UDPEndpoint = struct {
             .header = pre,
         };
 
-        stats.global_stats.udp.tx_packets += 1;
-        stats.global_stats.udp.tx_bytes += data.size;
+        stats.global_stats.udp.tx_packets.inc();
+        stats.global_stats.udp.tx_bytes.add(data.size);
 
         return r.writePacket(ProtocolNumber, pb);
     }
@@ -316,8 +309,8 @@ pub const UDPEndpoint = struct {
         const h = header.UDP.init(mut_pkt.data.first() orelse return);
         mut_pkt.data.trimFront(header.UDPMinimumSize);
 
-        stats.global_stats.udp.rx_packets += 1;
-        stats.global_stats.udp.rx_bytes += mut_pkt.data.size;
+        stats.global_stats.udp.rx_packets.inc();
+        stats.global_stats.udp.rx_bytes.add(mut_pkt.data.size);
 
         const cloned_data = mut_pkt.data.cloneInPool(&self.proto.view_pool) catch return;
 
@@ -384,7 +377,7 @@ pub const UDPEndpoint = struct {
             .reuse_address => {
                 self.options.reuse_port = true;
             },
-            .congestion_control => {},
+            .congestion_control, .tcp_nodelay => {},
         }
         return;
     }
@@ -395,6 +388,7 @@ pub const UDPEndpoint = struct {
             .ts_enabled => .{ .ts_enabled = false },
             .reuse_address => .{ .reuse_address = self.options.reuse_port },
             .congestion_control => .{ .congestion_control = .new_reno },
+            .tcp_nodelay => .{ .tcp_nodelay = false },
         };
     }
 

@@ -62,33 +62,43 @@ pub const EndpointState = enum {
     error_state,
 };
 
-/// SYN cookie secret for SYN flood mitigation.
+/// SYN cookie secrets for SYN flood mitigation.
 /// NOTE: RFC 4987 - SYN cookies encode connection state in the ISN,
 /// allowing the server to avoid allocating state for half-open connections.
-/// The secret SHOULD be rotated periodically (e.g., every 64 seconds).
-/// SAFETY: The secret must remain confidential; if leaked, an attacker
+/// SAFETY: The secrets must remain confidential; if leaked, an attacker
 /// can forge SYN cookies and bypass SYN flood protection.
-var syn_cookie_secret: [16]u8 = undefined;
+var syn_cookie_secrets: [2][16]u8 = undefined;
+var syn_cookie_current: u1 = 0;
 var syn_cookie_initialized: bool = false;
+var syn_cookie_last_rotation: i64 = 0;
+
+const SYN_COOKIE_ROTATION_SEC = 64;
 
 /// Initialize SYN cookie secret with random bytes.
 fn initSynCookieSecret() void {
     if (!syn_cookie_initialized) {
-        std.crypto.random.bytes(&syn_cookie_secret);
+        std.crypto.random.bytes(&syn_cookie_secrets[0]);
+        std.crypto.random.bytes(&syn_cookie_secrets[1]);
+        syn_cookie_last_rotation = std.time.timestamp();
         syn_cookie_initialized = true;
     }
 }
 
-/// Generate SYN cookie ISN using keyed hash.
-/// RFC 4987: ISN = hash(secret, src_ip || src_port || dst_ip || dst_port || timestamp)
-fn generateSynCookie(src_addr: tcpip.Address, src_port: u16, dst_addr: tcpip.Address, dst_port: u16) u32 {
-    initSynCookieSecret();
+// Rotate the active secret, keeping the previous one for validation.
+fn rotateSynCookieSecret() void {
+    const now = std.time.timestamp();
+    if (now - syn_cookie_last_rotation >= SYN_COOKIE_ROTATION_SEC) {
+        syn_cookie_current ^= 1;
+        std.crypto.random.bytes(&syn_cookie_secrets[syn_cookie_current]);
+        syn_cookie_last_rotation = now;
+    }
+}
 
-    // Use Wyhash with secret as seed
-    const seed = std.mem.readInt(u64, syn_cookie_secret[0..8], .little);
+/// Compute a SYN cookie hash using the given secret.
+fn computeSynCookieHash(secret: *const [16]u8, src_addr: tcpip.Address, src_port: u16, dst_addr: tcpip.Address, dst_port: u16) u32 {
+    const seed = std.mem.readInt(u64, secret[0..8], .little);
     var h = std.hash.Wyhash.init(seed);
 
-    // Hash addresses and ports
     switch (src_addr) {
         .v4 => |v4| h.update(&v4),
         .v6 => |v6| h.update(&v6),
@@ -104,23 +114,39 @@ fn generateSynCookie(src_addr: tcpip.Address, src_port: u16, dst_addr: tcpip.Add
     std.mem.writeInt(u16, &port_buf, dst_port, .big);
     h.update(&port_buf);
 
-    // Add timestamp (64-second granularity for rotation)
+    // Timestamp at 64-second granularity
     const ts: u32 = @intCast(@divFloor(std.time.timestamp(), 64));
     var ts_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &ts_buf, ts, .big);
     h.update(&ts_buf);
 
-    // Return lower 32 bits of hash
     return @truncate(h.final());
+}
+
+/// Generate SYN cookie ISN using the current secret.
+/// RFC 4987: ISN = hash(secret, src_ip || src_port || dst_ip || dst_port || timestamp)
+fn generateSynCookie(src_addr: tcpip.Address, src_port: u16, dst_addr: tcpip.Address, dst_port: u16) u32 {
+    initSynCookieSecret();
+    rotateSynCookieSecret();
+    return computeSynCookieHash(&syn_cookie_secrets[syn_cookie_current], src_addr, src_port, dst_addr, dst_port);
+}
+
+/// Validate a SYN cookie against both current and previous secrets.
+fn validateSynCookie(cookie: u32, src_addr: tcpip.Address, src_port: u16, dst_addr: tcpip.Address, dst_port: u16) bool {
+    initSynCookieSecret();
+    const current = computeSynCookieHash(&syn_cookie_secrets[syn_cookie_current], src_addr, src_port, dst_addr, dst_port);
+    if (cookie == current) return true;
+    const previous = computeSynCookieHash(&syn_cookie_secrets[syn_cookie_current ^ 1], src_addr, src_port, dst_addr, dst_port);
+    return cookie == previous;
 }
 
 pub const TCPProtocol = struct {
     allocator: std.mem.Allocator,
     view_pool: buffer.BufferPool,
     header_pool: buffer.BufferPool,
-    segment_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node),
-    packet_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node),
-    accept_node_pool: buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node),
+    segment_node_pool: buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Segment).Node),
+    packet_node_pool: buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Packet).Node),
+    accept_node_pool: buffer.Pool(std.DoublyLinkedList(tcpip.AcceptReturn).Node),
     endpoint_pool: buffer.Pool(TCPEndpoint),
     waiter_queue_pool: buffer.Pool(waiter.Queue),
 
@@ -130,9 +156,9 @@ pub const TCPProtocol = struct {
             .allocator = allocator,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 1048576),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 1048576),
-            .segment_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node).init(allocator, 1048576),
-            .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 1048576),
-            .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 262144),
+            .segment_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Segment).Node).init(allocator, 1048576),
+            .packet_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Packet).Node).init(allocator, 1048576),
+            .accept_node_pool = buffer.Pool(std.DoublyLinkedList(tcpip.AcceptReturn).Node).init(allocator, 262144),
             .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 1048576),
             .waiter_queue_pool = buffer.Pool(waiter.Queue).init(allocator, 524288),
         };
@@ -283,10 +309,10 @@ pub const TCPEndpoint = struct {
     stack_ref: bool = false,
 
     // Queues
-    accepted_queue: std.TailQueue(tcpip.AcceptReturn) = .{},
-    rcv_list: std.TailQueue(Packet) = .{},
-    ooo_list: std.TailQueue(Packet) = .{},
-    snd_queue: std.TailQueue(Segment) = .{},
+    accepted_queue: std.DoublyLinkedList(tcpip.AcceptReturn) = .{},
+    rcv_list: std.DoublyLinkedList(Packet) = .{},
+    ooo_list: std.DoublyLinkedList(Packet) = .{},
+    snd_queue: std.DoublyLinkedList(Segment) = .{},
 
     // Timers
     retransmit_timer: time.Timer = undefined,
@@ -440,7 +466,7 @@ pub const TCPEndpoint = struct {
             }
         }
 
-        stats.global_stats.tcp.active_endpoints += 1;
+        stats.global_stats.tcp.active_endpoints.inc();
 
         self.stack = s;
         self.proto = proto;
@@ -644,7 +670,7 @@ pub const TCPEndpoint = struct {
             // Zero-window probe (RFC 793 Section 3.7)
             if (avail == 0 and self.snd_wnd == 0 and self.snd_queue.first == null and total_sent == 0) avail = 1;
 
-            var payload_len = @min(@min(@as(u32, @intCast(view.size - total_sent)), avail), @as(u32, self.max_segment_size));
+            const payload_len = @min(@min(@as(u32, @intCast(view.size - total_sent)), avail), @as(u32, self.max_segment_size));
 
             // NOTE: Nagle algorithm (RFC 896) - buffer small segments
             // unless TCP_NODELAY is set or we have a full MSS
@@ -823,7 +849,7 @@ pub const TCPEndpoint = struct {
             // NOTE: Connection is dead, close it
             log.warn("TCP: Keepalive probes exhausted, closing connection", .{});
             self.state = .error_state;
-            self.notify(waiter.EventErr | waiter.EventHup);
+            self.notify(waiter.EventErr | waiter.EventHUp);
             return;
         }
 
@@ -856,7 +882,7 @@ pub const TCPEndpoint = struct {
         // NOTE: Keepalive probe uses seq = snd_una - 1 to elicit ACK
         const probe_seq = self.snd_una -% 1;
         h.encode(la.port, ra.port, probe_seq, self.rcv_nxt, header.TCPFlagAck, @as(u16, @intCast(@min(self.rcv_wnd >> @as(u5, @intCast(self.rcv_wnd_scale)), 65535))));
-        h.setChecksum(h.calculateChecksum(la.addr, ra.addr, &.{}));
+        h.setChecksum(h.calculateChecksum(la.addr.v4, ra.addr.v4, &.{}));
 
         const pb = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.empty(),
@@ -864,7 +890,7 @@ pub const TCPEndpoint = struct {
         };
 
         try r.writePacket(ProtocolNumber, pb);
-        stats.global_stats.tcp.tx_keepalive_probes += 1;
+        stats.global_stats.tcp.tx_keepalive_probes.inc();
     }
 
     /// Reset keepalive timer on activity.
@@ -1035,17 +1061,17 @@ pub const TCPEndpoint = struct {
                 self.rcv_packets_since_ack = 0;
             }
 
-            stats.global_stats.tcp.tx_segments += 1;
+            stats.global_stats.tcp.tx_segments.inc();
             if (node.data.flags & header.TCPFlagSyn != 0) {
                 if (node.data.flags & header.TCPFlagAck != 0) {
-                    stats.global_stats.tcp.tx_syn_ack += 1;
+                    stats.global_stats.tcp.tx_syn_ack.inc();
                 } else {
-                    stats.global_stats.tcp.tx_syn += 1;
+                    stats.global_stats.tcp.tx_syn.inc();
                 }
             }
-            if (node.data.flags & header.TCPFlagAck != 0) stats.global_stats.tcp.tx_ack += 1;
-            if (node.data.flags & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh += 1;
-            if (node.data.flags & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin += 1;
+            if (node.data.flags & header.TCPFlagAck != 0) stats.global_stats.tcp.tx_ack.inc();
+            if (node.data.flags & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh.inc();
+            if (node.data.flags & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin.inc();
 
             node.data.timestamp = now;
             batch_count += 1;
@@ -1215,7 +1241,7 @@ pub const TCPEndpoint = struct {
     }
 
     fn destroy(self: *TCPEndpoint) void {
-        stats.global_stats.tcp.active_endpoints -= 1;
+        stats.global_stats.tcp.active_endpoints.dec();
 
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
@@ -1543,17 +1569,17 @@ pub const TCPEndpoint = struct {
         h.setChecksum(h.calculateChecksum(la.addr.v4, ra.addr.v4, &[_]u8{}));
         const pb = tcpip.PacketBuffer{ .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 }, .header = pre };
 
-        stats.global_stats.tcp.tx_segments += 1;
+        stats.global_stats.tcp.tx_segments.inc();
         if (flags & header.TCPFlagSyn != 0) {
             if (flags & header.TCPFlagAck != 0) {
-                stats.global_stats.tcp.tx_syn_ack += 1;
+                stats.global_stats.tcp.tx_syn_ack.inc();
             } else {
-                stats.global_stats.tcp.tx_syn += 1;
+                stats.global_stats.tcp.tx_syn.inc();
             }
         }
-        if (flags & header.TCPFlagAck != 0) stats.global_stats.tcp.tx_ack += 1;
-        if (flags & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh += 1;
-        if (flags & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin += 1;
+        if (flags & header.TCPFlagAck != 0) stats.global_stats.tcp.tx_ack.inc();
+        if (flags & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh.inc();
+        if (flags & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin.inc();
 
         var mut_r = r;
         try mut_r.writePacket(6, pb);
@@ -1603,9 +1629,9 @@ pub const TCPEndpoint = struct {
         const pb = tcpip.PacketBuffer{ .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 }, .header = pre };
         var mut_r = r.*;
         try mut_r.writePacket(ProtocolNumber, pb);
-        stats.global_stats.tcp.tx_segments += 1;
-        stats.global_stats.tcp.tx_syn_ack += 1;
-        stats.global_stats.tcp.tx_ack += 1;
+        stats.global_stats.tcp.tx_segments.inc();
+        stats.global_stats.tcp.tx_syn_ack.inc();
+        stats.global_stats.tcp.tx_ack.inc();
     }
 
     /// Main packet handler implementing RFC 793 state machine.
@@ -1633,17 +1659,17 @@ pub const TCPEndpoint = struct {
         const h = header.TCP.init(v);
         const fl = h.flags();
 
-        stats.global_stats.tcp.rx_segments += 1;
+        stats.global_stats.tcp.rx_segments.inc();
         if (fl & header.TCPFlagSyn != 0) {
             if (fl & header.TCPFlagAck != 0) {
-                stats.global_stats.tcp.rx_syn_ack += 1;
+                stats.global_stats.tcp.rx_syn_ack.inc();
             } else {
-                stats.global_stats.tcp.rx_syn += 1;
+                stats.global_stats.tcp.rx_syn.inc();
             }
         }
-        if (fl & header.TCPFlagAck != 0) stats.global_stats.tcp.rx_ack += 1;
-        if (fl & header.TCPFlagPsh != 0) stats.global_stats.tcp.rx_psh += 1;
-        if (fl & header.TCPFlagFin != 0) stats.global_stats.tcp.rx_fin += 1;
+        if (fl & header.TCPFlagAck != 0) stats.global_stats.tcp.rx_ack.inc();
+        if (fl & header.TCPFlagPsh != 0) stats.global_stats.tcp.rx_psh.inc();
+        if (fl & header.TCPFlagFin != 0) stats.global_stats.tcp.rx_fin.inc();
 
         // NOTE: RFC 1337 - Handle RST in TIME_WAIT carefully
         if (self.state == .time_wait) {
@@ -1724,7 +1750,7 @@ pub const TCPEndpoint = struct {
                     // NOTE: RFC 793 Section 3.4 - SYN received in LISTEN state
                     if (self.syncache.count() + self.accepted_queue.len >= self.backlog) {
                         log.warn("Listen queue full: syncache={} accepted={} backlog={}", .{ self.syncache.count(), self.accepted_queue.len, self.backlog });
-                        stats.global_stats.tcp.syncache_dropped += 1;
+                        stats.global_stats.tcp.syncache_dropped.inc();
                         return;
                     }
                     const sync_key = SyncacheKey{ .addr = id.remote_address, .port = h.sourcePort() };
@@ -1780,7 +1806,7 @@ pub const TCPEndpoint = struct {
                         const entry = kv.value;
                         if (h.ackNumber() == entry.snd_nxt +% 1) {
                             const new_ep = self.proto.endpoint_pool.acquire() catch {
-                                stats.global_stats.tcp.pool_exhausted += 1;
+                                stats.global_stats.tcp.pool_exhausted.inc();
                                 return;
                             };
                             const new_wq = self.proto.waiter_queue_pool.acquire() catch {
@@ -1828,7 +1854,7 @@ pub const TCPEndpoint = struct {
                             };
                             node.data = .{ .ep = new_ep.endpoint(), .wq = new_wq };
                             self.accepted_queue.append(node);
-                            stats.global_stats.tcp.passive_opens += 1;
+                            stats.global_stats.tcp.passive_opens.inc();
                             notify_mask |= waiter.EventIn;
                         }
                     }
@@ -1873,7 +1899,7 @@ pub const TCPEndpoint = struct {
                         if (!ws_negotiated) self.rcv_wnd_scale = 0;
                         self.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(self.snd_wnd_scale));
                         self.sendControl(header.TCPFlagAck) catch {};
-                        stats.global_stats.tcp.active_opens += 1;
+                        stats.global_stats.tcp.active_opens.inc();
                         notify_mask |= waiter.EventOut;
                     }
                 }
@@ -1900,7 +1926,7 @@ pub const TCPEndpoint = struct {
                         self.rcv_nxt +%= @as(u32, @intCast(data_len));
                         self.processOOO();
                         self.maybeSendDelayedAck(data_len);
-                        stats.global_stats.tcp.rx_segments += 1;
+                        stats.global_stats.tcp.rx_segments.inc();
                         notify_mask |= waiter.EventIn;
                     }
                     if (fl & header.TCPFlagFin != 0) {
