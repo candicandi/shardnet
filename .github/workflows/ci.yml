@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+      - name: Build (static + shared lib)
+        run: zig build
+      - name: Test
+        run: zig build test
+
+  cross-compile:
+    name: Cross-compile (macOS target, build-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+      - name: Build for aarch64-macos
+        run: zig build -Dtarget=aarch64-macos
+      - name: Build for x86_64-macos
+        run: zig build -Dtarget=x86_64-macos
