@@ -17,8 +17,9 @@ pub const Cluster = struct {
     }
 
     pub fn release(self: *Cluster) void {
-        // SAFETY: Cluster must belong to a valid pool.
-        std.debug.assert(self.pool != undefined);
+        // SAFETY: guards against double-release; ref_count is unsigned so a
+        // release at zero would silently underflow.
+        std.debug.assert(self.ref_count > 0);
         self.ref_count -= 1;
         if (self.ref_count == 0) {
             self.pool.returnToPool(self);
