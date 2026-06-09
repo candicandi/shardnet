@@ -170,6 +170,11 @@ pub const TCPProtocol = struct {
         self.endpoint_pool.prewarm(1024) catch {};
         self.waiter_queue_pool.prewarm(1024) catch {};
 
+        // prewarm() uses allocator.create(), which leaves fields indeterminate —
+        // default field values don't apply. initialize_v2() and deinit() both read
+        // `pooled`, so it must be defined or they act on garbage cc/sack pointers.
+        for (self.endpoint_pool.free_list.items) |ep| ep.pooled = false;
+
         return self;
     }
 
