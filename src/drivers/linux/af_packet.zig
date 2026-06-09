@@ -200,7 +200,7 @@ pub const AfPacket = struct {
     dispatcher: ?*stack.NetworkDispatcher = null,
 
     // -- TPACKET_V3 RX ring (block-based) -----------------------------------
-    rx_ring: []align(std.mem.page_size) u8,
+    rx_ring: []align(std.heap.page_size_min) u8,
     rx_block_size: u32,
     rx_block_nr: u32,
     rx_block_idx: u32 = 0,
@@ -358,7 +358,7 @@ pub const AfPacket = struct {
             .if_index = if_index,
             .address = .{ .addr = mac },
             // RX (V3 block-based)
-            .rx_ring = @as([*]align(std.mem.page_size) u8, @ptrCast(@alignCast(rx_ring.ptr)))[0..rx_ring_size],
+            .rx_ring = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(rx_ring.ptr)))[0..rx_ring_size],
             .rx_block_size = cfg.rx_block_size,
             .rx_block_nr = cfg.rx_block_nr,
             // TX (V2 frame-based)
@@ -430,7 +430,7 @@ pub const AfPacket = struct {
         const rx_ring_size: usize = @as(usize, self.rx_block_size) * @as(usize, self.rx_block_nr);
         const tx_ring_size: usize = @as(usize, self.tx_frame_size) * @as(usize, self.tx_frame_nr);
         const total_ring_size = rx_ring_size + tx_ring_size;
-        const mmap_ptr = @as([*]align(std.mem.page_size) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
+        const mmap_ptr = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
         std.posix.munmap(mmap_ptr[0..total_ring_size]);
         std.posix.close(self.fd);
     }

@@ -98,11 +98,11 @@ pub const RateLimiter = struct {
 /// RTT measurement for echo replies.
 pub const RttMeasurement = struct {
     /// Pending echo requests: sequence -> send timestamp (ns).
-    pending: std.AutoHashMap(u16, i64),
+    pending: std.AutoHashMap(u16, i128),
 
     pub fn init(allocator: std.mem.Allocator) RttMeasurement {
         return .{
-            .pending = std.AutoHashMap(u16, i64).init(allocator),
+            .pending = std.AutoHashMap(u16, i128).init(allocator),
         };
     }
 

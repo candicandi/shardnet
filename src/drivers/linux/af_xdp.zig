@@ -42,7 +42,7 @@ pub const AfXdp = struct {
     if_index: i32,
 
     // UMEM
-    umem_area: []align(std.mem.page_size) u8,
+    umem_area: []align(std.heap.page_size_min) u8,
     chunk_size: u32,
     headroom: u32,
 
@@ -139,7 +139,7 @@ pub const AfXdp = struct {
 
         // 1. Allocate UMEM (aligned to page size)
         const umem_size = NUM_FRAMES * config.chunk_size;
-        const umem_area = try allocator.alignedAlloc(u8, std.mem.page_size, umem_size);
+        const umem_area = try allocator.alignedAlloc(u8, std.heap.page_size_min, umem_size);
         errdefer allocator.free(umem_area);
 
         // 2. Register UMEM

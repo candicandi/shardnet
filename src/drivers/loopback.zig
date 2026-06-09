@@ -40,7 +40,7 @@ pub const Loopback = struct {
     // and writePacket() when the values are comptime-known zero.
     delay_ns: u64,
     loss_pct: u8,
-    prng: std.rand.DefaultPrng,
+    prng: std.Random.DefaultPrng,
 
     /// Total number of packets submitted to writePacket (before loss).
     loopback_tx: u64 = 0,
@@ -128,7 +128,7 @@ pub const Loopback = struct {
             .node_pool = NodePool.init(allocator, config.node_pool_capacity),
             .delay_ns = config.delay_ns,
             .loss_pct = config.loss_pct,
-            .prng = std.rand.DefaultPrng.init(config.prng_seed),
+            .prng = std.Random.DefaultPrng.init(config.prng_seed),
         };
     }
 

@@ -903,7 +903,7 @@ test "Checksum calculation" {
 }
 
 test "Checksum SIMD vs Scalar comparison" {
-    var prng = std.rand.DefaultPrng.init(0);
+    var prng = std.Random.DefaultPrng.init(0);
     const random = prng.random();
 
     var buf: [4096]u8 = undefined;
