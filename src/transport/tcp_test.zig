@@ -4,13 +4,14 @@
 /// fast retransmit trigger, window scaling negotiation, and state transitions.
 
 const std = @import("std");
-const tcpip = @import("../tcpip.zig");
-const stack = @import("../stack.zig");
-const header = @import("../header.zig");
-const buffer = @import("../buffer.zig");
-const waiter = @import("../waiter.zig");
-const ipv4 = @import("../network/ipv4.zig");
-const tcp = @import("tcp.zig");
+const shardnet = @import("shardnet");
+const tcpip = shardnet.tcpip;
+const stack = shardnet.stack;
+const header = shardnet.header;
+const buffer = shardnet.buffer;
+const waiter = shardnet.waiter;
+const ipv4 = shardnet.network.ipv4;
+const tcp = shardnet.transport.tcp;
 const TCPEndpoint = tcp.TCPEndpoint;
 const TCPProtocol = tcp.TCPProtocol;
 

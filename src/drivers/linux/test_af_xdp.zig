@@ -1,22 +1,28 @@
 const std = @import("std");
-const AfXdp = @import("af_xdp.zig").AfXdp;
-const tcpip = @import("../../tcpip.zig");
-const stack = @import("../../stack.zig");
-const buffer = @import("../../buffer.zig");
-const header = @import("../../header.zig");
-const xdp_defs = @import("xdp_defs.zig");
-const stats = @import("../../stats.zig");
+const shardnet = @import("shardnet");
+const af_xdp = shardnet.drivers.af_xdp;
+const AfXdp = af_xdp.AfXdp;
+const tcpip = shardnet.tcpip;
+const stack = shardnet.stack;
+const buffer = shardnet.buffer;
+const header = shardnet.header;
+const xdp_defs = shardnet.drivers.xdp_defs;
+const stats = shardnet.stats;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Execute a shell command via the system libc.  Returns `true` on success
-// (exit code 0), `false` otherwise.  All output goes to /dev/null so tests
-// stay quiet.
+// Execute a shell command.  Returns `true` on success (exit code 0),
+// `false` otherwise.  Output is discarded so tests stay quiet.
 fn execCmd(cmd: [*:0]const u8) bool {
-    const rc = std.c.system(cmd);
-    return rc == 0;
+    const argv = [_][]const u8{ "/bin/sh", "-c", std.mem.span(cmd) };
+    var child = std.process.Child.init(&argv, std.heap.page_allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    const term = child.spawnAndWait() catch return false;
+    return term == .Exited and term.Exited == 0;
 }
 
 // Guard that skips a test (returns from the calling test) when AF_XDP
@@ -110,12 +116,16 @@ test "AfXdp basic properties" {
         .fd = dummy_fd,
         .allocator = allocator,
         .umem_area = undefined,
+        .chunk_size = 0,
+        .headroom = 0,
         .rx_ring = undefined,
         .tx_ring = undefined,
         .fill_ring = undefined,
         .comp_ring = undefined,
         .if_index = 0,
         .frame_manager = undefined,
+        .zero_copy_mode = false,
+        .stats = .{},
     };
 
     try std.testing.expectEqual(@as(u32, 1500), xdp.mtu_val);
@@ -129,7 +139,7 @@ test "AfXdp functional init" {
 
     // This test only works if run as root and veth_test0 exists.
     // We use a guard to skip if not available.
-    var xdp = AfXdp.init(allocator, "veth_test0", 0) catch |err| {
+    var xdp = AfXdp.init(allocator, "veth_test0", 0, .{}) catch |err| {
         if (isEnvironmentError(err)) return;
         std.debug.print("Init failed: {}\n", .{err});
         return;
@@ -171,7 +181,7 @@ test "AfXdp veth pair send 100 packets and receive all" {
     }
 
     // -- 3. Bind AF_XDP on veth_xdp0 ----------------------------------------
-    var xdp = AfXdp.init(allocator, "veth_xdp0", 0) catch |err| {
+    var xdp = AfXdp.init(allocator, "veth_xdp0", 0, .{}) catch |err| {
         if (isEnvironmentError(err)) {
             std.debug.print("Skipping: AF_XDP init failed ({any})\n", .{err});
             return;
@@ -302,7 +312,7 @@ test "AfXdp ZEROCOPY to COPY fallback" {
     }
 
     // --- Fall back to COPY mode -------------------------------------------
-    var copy_xdp = AfXdp.init(allocator, "veth_xdp0", 0) catch |err| {
+    var copy_xdp = AfXdp.init(allocator, "veth_xdp0", 0, .{}) catch |err| {
         if (isEnvironmentError(err)) {
             std.debug.print("Skipping: AF_XDP init failed in COPY mode ({any})\n", .{err});
             return;
@@ -448,7 +458,7 @@ fn zerocopyBind(allocator: std.mem.Allocator, if_name: []const u8, queue_id: u32
     const frame_size: u32 = 2048;
     const umem_size = num_frames * frame_size;
 
-    const umem_area = allocator.alignedAlloc(u8, std.mem.page_size, umem_size) catch return null;
+    const umem_area = allocator.alignedAlloc(u8, std.heap.page_size_min, umem_size) catch return null;
     defer allocator.free(umem_area);
 
     const reg = xdp_defs.xdp_umem_reg{

@@ -7,15 +7,17 @@
 /// - TIME_WAIT reuse with higher sequence number SYN
 
 const std = @import("std");
-const stack = @import("../stack.zig");
-const tcpip = @import("../tcpip.zig");
-const header = @import("../header.zig");
-const buffer = @import("../buffer.zig");
-const waiter = @import("../waiter.zig");
-const ipv4 = @import("../network/ipv4.zig");
-const TCPProtocol = @import("tcp.zig").TCPProtocol;
-const TCPEndpoint = @import("tcp.zig").TCPEndpoint;
-const EndpointState = @import("tcp.zig").EndpointState;
+const shardnet = @import("shardnet");
+const stack = shardnet.stack;
+const tcpip = shardnet.tcpip;
+const header = shardnet.header;
+const buffer = shardnet.buffer;
+const waiter = shardnet.waiter;
+const ipv4 = shardnet.network.ipv4;
+const tcp = shardnet.transport.tcp;
+const TCPProtocol = tcp.TCPProtocol;
+const TCPEndpoint = tcp.TCPEndpoint;
+const EndpointState = tcp.EndpointState;
 
 /// Mock link endpoint that drops all packets (for timer tests).
 const NullLinkEndpoint = struct {

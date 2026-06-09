@@ -39,6 +39,7 @@ pub const drivers = struct {
     pub const tap = if (builtin.os.tag == .linux) @import("drivers/linux/tap.zig") else struct {};
     pub const af_packet = if (builtin.os.tag == .linux) @import("drivers/linux/af_packet.zig") else struct {};
     pub const af_xdp = if (builtin.os.tag == .linux) @import("drivers/linux/af_xdp.zig") else struct {};
+    pub const xdp_defs = if (builtin.os.tag == .linux) @import("drivers/linux/xdp_defs.zig") else struct {};
 };
 
 const VERSION = "0.1.0";
@@ -225,7 +226,4 @@ pub const utils = @import("utils.zig");
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("drivers/linux/test_af_xdp.zig");
-    _ = @import("transport/tcp_test.zig");
-    _ = @import("transport/tcp_2msl_test.zig");
 }
