@@ -1,4 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// shardnet targets Zig 0.14.x. Newer toolchains (0.15+) change build/std APIs
+// and fail to compile; guard with a clear message instead of a cryptic error.
+comptime {
+    const v = builtin.zig_version;
+    if (v.major != 0 or v.minor != 14) {
+        @compileError("shardnet requires Zig 0.14.x; found " ++ builtin.zig_version_string);
+    }
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
