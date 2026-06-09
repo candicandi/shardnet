@@ -30,8 +30,10 @@ pub const link = struct {
     pub const eth = @import("link/eth.zig");
 };
 pub const dns = @import("dns.zig");
-pub const posix = @import("posix.zig");
-pub const event_mux = @import("event_mux.zig");
+// posix and event_mux are Linux-only (timerfd, raw syscalls); gate like the drivers
+// so refAllDecls in tests doesn't force them to compile on macOS/BSD.
+pub const posix = if (builtin.os.tag == .linux) @import("posix.zig") else struct {};
+pub const event_mux = if (builtin.os.tag == .linux) @import("event_mux.zig") else struct {};
 pub const stats = @import("stats.zig");
 
 pub const drivers = struct {

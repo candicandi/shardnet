@@ -70,15 +70,28 @@ pub fn build(b: *std.Build) void {
 
     // Discover *_test.zig files under src/ and compile each as a standalone
     // test artifact so zig build test exercises every test in the tree.
+    // Platform-agnostic test files run on every target.
     const test_files = [_][]const u8{
         "src/transport/tcp_test.zig",
         "src/transport/tcp_2msl_test.zig",
-        "src/drivers/linux/test_af_xdp.zig",
     };
 
     for (test_files) |path| {
         const t = b.addTest(.{
             .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+        });
+        t.root_module.addImport("build_options", options_mod);
+        t.root_module.addImport("shardnet", shardnet_mod);
+        const run_t = b.addRunArtifact(t);
+        test_step.dependOn(&run_t.step);
+    }
+
+    // AF_XDP is Linux-only; only compile its test when targeting Linux.
+    if (target.result.os.tag == .linux) {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/drivers/linux/test_af_xdp.zig"),
             .target = target,
             .optimize = optimize,
         });
