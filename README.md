@@ -16,13 +16,17 @@ Shardnet is a full TCP/IP stack — IPv4/IPv6, TCP, UDP, ICMP/ICMPv6, ARP and DN
 
 ## Architecture
 
-<div align="center">
+### Overall Architecture
 
-![Overall architecture — the shardnet layered stack](assets/architecture-overview.svg)
+<p align="center">
+  <img src="assets/architecture-overview.svg" alt="Overall architecture — the shardnet layered stack">
+</p>
 
-![System context — shardnet among external actors](assets/architecture-context.svg)
+### System Context
 
-</div>
+<p align="center">
+  <img src="assets/architecture-context.svg" alt="System context — shardnet among external actors">
+</p>
 
 ## Quick start
 
