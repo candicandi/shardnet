@@ -574,6 +574,7 @@ test "UDP handlePacket" {
 
     var wq = waiter.Queue{};
     const udp_proto = UDPProtocol.init(allocator);
+    defer udp_proto.deinit(allocator);
     var ep = try allocator.create(UDPEndpoint);
     ep.* = UDPEndpoint.init(&s, udp_proto, &wq);
     defer ep.transportEndpoint().close();

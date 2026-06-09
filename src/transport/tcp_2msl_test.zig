@@ -75,6 +75,7 @@ test "TCP 2MSL TIME_WAIT expiration" {
     var wq_client = waiter.Queue{};
     const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
     const ep_client: *TCPEndpoint = @ptrCast(@alignCast(ep_client_res.ptr));
+    defer ep_client.close();
 
     // Set up endpoint in FIN_WAIT_2 state (waiting for peer's FIN)
     ep_client.state = .fin_wait2;
@@ -113,9 +114,10 @@ test "TCP 2MSL TIME_WAIT expiration" {
     // Should be in TIME_WAIT
     try std.testing.expectEqual(EndpointState.time_wait, ep_client.state);
     try std.testing.expect(ep_client.time_wait_timer.active);
-    // Should still be registered
-    try std.testing.expect(s.endpoints.get(id) != null);
-    if (s.endpoints.get(id)) |e| e.decRef();
+    // Should still be registered (get() incRefs, so balance it with decRef)
+    const reg = s.endpoints.get(id);
+    try std.testing.expect(reg != null);
+    if (reg) |e| e.decRef();
 
     // Advance time by 2MSL (200ms)
     _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 201);
