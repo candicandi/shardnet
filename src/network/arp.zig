@@ -201,10 +201,14 @@ pub const ARPProtocol = struct {
 
     fn parseAddresses(ptr: *anyopaque, pkt: tcpip.PacketBuffer) stack.NetworkProtocol.AddressPair {
         _ = ptr;
-        const v = pkt.data.first() orelse return .{
+        const zero = stack.NetworkProtocol.AddressPair{
             .src = .{ .v4 = .{ 0, 0, 0, 0 } },
             .dst = .{ .v4 = .{ 0, 0, 0, 0 } },
         };
+        const v = pkt.data.first() orelse return zero;
+        // Called from the NIC dispatch before length validation; a runt frame
+        // must not drive the address accessors out of bounds.
+        if (v.len < header.ARPSize) return zero;
         const h = header.ARP.init(v);
         return .{
             .src = .{ .v4 = h.protocolAddressSender() },

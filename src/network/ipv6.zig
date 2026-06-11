@@ -159,10 +159,14 @@ pub const IPv6Protocol = struct {
 
     fn parseAddresses(ptr: *anyopaque, pkt: tcpip.PacketBuffer) stack.NetworkProtocol.AddressPair {
         _ = ptr;
-        const v = pkt.data.first() orelse return .{
+        const zero = stack.NetworkProtocol.AddressPair{
             .src = .{ .v6 = [_]u8{0} ** 16 },
             .dst = .{ .v6 = [_]u8{0} ** 16 },
         };
+        const v = pkt.data.first() orelse return zero;
+        // Called from the NIC dispatch before length validation; a runt frame
+        // must not drive the address accessors out of bounds.
+        if (v.len < header.IPv6MinimumSize) return zero;
         const h = header.IPv6.init(v);
         return .{
             .src = .{ .v6 = h.sourceAddress() },

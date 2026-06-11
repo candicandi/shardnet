@@ -588,7 +588,8 @@ pub const IPv6 = struct {
         if (self.data.len < IPv6MinimumSize) return false;
         if ((self.data[0] >> 4) != IPv6Version) return false;
         const plen = self.payloadLength();
-        if (pkt_size < IPv6MinimumSize + plen) return false;
+        // usize add: IPv6MinimumSize + plen would overflow u16 for plen near 65535.
+        if (pkt_size < IPv6MinimumSize + @as(usize, plen)) return false;
         return true;
     }
 };
