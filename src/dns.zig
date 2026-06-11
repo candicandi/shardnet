@@ -76,17 +76,20 @@ pub const ResourceRecord = struct {
     ttl: u32,
     rdata: RData,
 
-    pub const RData = union(RecordType) {
+    // Auto-tagged. It cannot be a union(RecordType): RecordType is non-exhaustive,
+    // so it has no `_` field for a union to map a catch-all onto. `unknown` holds
+    // the raw rdata of record types we don't parse structurally.
+    pub const RData = union(enum) {
         A: [4]u8,
-        AAAA: [16]u8,
-        CNAME: []const u8,
-        TXT: []const u8,
-        SRV: SrvRecord,
         NS: []const u8,
+        CNAME: []const u8,
+        SOA: void, // Not fully parsed
         PTR: []const u8,
         MX: MxRecord,
-        SOA: void, // Not fully parsed
-        _: []const u8,
+        TXT: []const u8,
+        AAAA: [16]u8,
+        SRV: SrvRecord,
+        unknown: []const u8,
     };
 
     pub const SrvRecord = struct {
@@ -692,7 +695,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, buf: []const u8) !struct {
     errdefer {
         for (answers.items) |rr| {
             switch (rr.rdata) {
-                .CNAME, .TXT, .NS, .PTR => |s| allocator.free(s),
+                .CNAME, .TXT, .NS, .PTR, .unknown => |s| allocator.free(s),
                 .SRV => |srv| allocator.free(srv.target),
                 .MX => |mx| allocator.free(mx.exchange),
                 else => {},
@@ -787,7 +790,7 @@ fn parseResourceRecord(allocator: std.mem.Allocator, buf: []const u8, pos: *usiz
         },
         else => blk: {
             const data = try allocator.dupe(u8, buf[pos.*..][0..rdlen]);
-            break :blk .{ ._ = data };
+            break :blk .{ .unknown = data };
         },
     };
 
