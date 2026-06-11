@@ -279,7 +279,10 @@ pub const IPv6Protocol = struct {
         const h = header.IPv6.init(ip_header);
         h.encode(src, dst, 58, @as(u16, @intCast(pkt.data.size)));
 
-        nic.linkEP.writePacket(&r, ProtocolNumber, mut_pkt) catch {};
+        nic.linkEP.writePacket(&r, ProtocolNumber, mut_pkt) catch |err| {
+            log.debug("IPv6: solicited-node NS tx failed: {}", .{err});
+            stats.global_stats.direction.tx_drops.inc();
+        };
 
         // Also send Router Solicitation to all-routers multicast
         self.sendRouterSolicitation(nic) catch {};

@@ -200,7 +200,10 @@ pub const ICMPv6PacketHandler = struct {
         const reply_route = r.*;
         if (r.nic.network_endpoints.get(0x86dd)) |ep| {
             stats.global_stats.icmpv6.tx_echo_replies.inc();
-            ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
+            ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch |err| {
+                log.debug("ICMPv6: echo reply tx failed: {}", .{err});
+                stats.global_stats.direction.tx_drops.inc();
+            };
         }
     }
 
@@ -279,7 +282,10 @@ pub const ICMPv6PacketHandler = struct {
 
         if (r.nic.network_endpoints.get(0x86dd)) |ep| {
             stats.global_stats.icmpv6.tx_neighbor_advertisements.inc();
-            ep.writePacket(&na_route, ProtocolNumber, na_pkt) catch {};
+            ep.writePacket(&na_route, ProtocolNumber, na_pkt) catch |err| {
+                log.debug("ICMPv6: neighbor advertisement tx failed: {}", .{err});
+                stats.global_stats.direction.tx_drops.inc();
+            };
         }
     }
 
@@ -430,7 +436,10 @@ pub const ICMPv6PacketHandler = struct {
         };
 
         if (nic.network_endpoints.get(0x86dd)) |ep| {
-            ep.writePacket(&r, ProtocolNumber, pkt) catch {};
+            ep.writePacket(&r, ProtocolNumber, pkt) catch |err| {
+                log.debug("ICMPv6: MLD report tx failed: {}", .{err});
+                stats.global_stats.direction.tx_drops.inc();
+            };
         }
     }
 };

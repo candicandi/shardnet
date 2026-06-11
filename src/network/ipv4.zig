@@ -274,7 +274,10 @@ pub const IPv4Endpoint = struct {
 
         if (remote_link_address == null) {
             const arp_proto_ptr = self.nic.stack.network_protocols.get(0x0806) orelse return tcpip.Error.NoRoute;
-            arp_proto_ptr.linkAddressRequest(r.remote_address, r.local_address, self.nic) catch {};
+            arp_proto_ptr.linkAddressRequest(r.remote_address, r.local_address, self.nic) catch |err| {
+                log.debug("IPv4: ARP request for {any} failed: {}", .{ r.remote_address.v4, err });
+                stats.global_stats.direction.tx_drops.inc();
+            };
             return tcpip.Error.WouldBlock;
         }
 

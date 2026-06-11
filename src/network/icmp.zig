@@ -232,7 +232,10 @@ pub const ICMPv4PacketHandler = struct {
         const reply_route = r.*;
         if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
             stats.global_stats.icmp.tx_echo_replies.inc();
-            ip_ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
+            ip_ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch |err| {
+                log.debug("ICMP: echo reply tx failed: {}", .{err});
+                stats.global_stats.direction.tx_drops.inc();
+            };
         }
     }
 
@@ -296,7 +299,10 @@ pub const ICMPv4PacketHandler = struct {
 
         if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
             stats.global_stats.icmp.tx_dest_unreachable.inc();
-            ip_ep.writePacket(r, ProtocolNumber, pkt) catch {};
+            ip_ep.writePacket(r, ProtocolNumber, pkt) catch |err| {
+                log.debug("ICMP: error message tx failed: {}", .{err});
+                stats.global_stats.direction.tx_drops.inc();
+            };
         }
     }
 
@@ -335,7 +341,10 @@ pub const ICMPv4PacketHandler = struct {
 
         if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
             stats.global_stats.icmp.tx_time_exceeded.inc();
-            ip_ep.writePacket(r, ProtocolNumber, pkt) catch {};
+            ip_ep.writePacket(r, ProtocolNumber, pkt) catch |err| {
+                log.debug("ICMP: error message tx failed: {}", .{err});
+                stats.global_stats.direction.tx_drops.inc();
+            };
         }
     }
 };

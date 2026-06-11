@@ -328,7 +328,10 @@ pub const ARPEndpoint = struct {
             .nic = self.nic,
         };
 
-        self.nic.linkEP.writePacket(&r, ProtocolNumber, pb) catch {};
+        self.nic.linkEP.writePacket(&r, ProtocolNumber, pb) catch |err| {
+            log.debug("ARP: announcement/probe tx failed: {}", .{err});
+            stats.global_stats.direction.tx_drops.inc();
+        };
     }
 
     /// Send an RFC 5227 ARP probe.
@@ -363,7 +366,10 @@ pub const ARPEndpoint = struct {
             .nic = self.nic,
         };
 
-        self.nic.linkEP.writePacket(&r, ProtocolNumber, pb) catch {};
+        self.nic.linkEP.writePacket(&r, ProtocolNumber, pb) catch |err| {
+            log.debug("ARP: announcement/probe tx failed: {}", .{err});
+            stats.global_stats.direction.tx_drops.inc();
+        };
     }
 
     /// Send an RFC 5227 ARP announcement.
@@ -487,7 +493,10 @@ pub const ARPEndpoint = struct {
                 };
 
                 stats.global_stats.arp.tx_replies.inc();
-                self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
+                self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch |err| {
+                    log.debug("ARP: reply tx failed: {}", .{err});
+                    stats.global_stats.direction.tx_drops.inc();
+                };
             }
         } else if (h.op() == 2) { // Reply
             stats.global_stats.arp.rx_replies.inc();
