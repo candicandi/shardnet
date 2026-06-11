@@ -543,6 +543,7 @@ pub const TCPEndpoint = struct {
         .incRef = incRef_external,
         .decRef = decRef_external,
         .notify = notify_external,
+        .abort = abort_external,
     };
 
     fn handlePacket_external(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
@@ -1206,6 +1207,17 @@ pub const TCPEndpoint = struct {
     fn decRef_external(ptr: *anyopaque) void {
         const self: *TCPEndpoint = @ptrCast(@alignCast(ptr));
         self.decRef();
+    }
+    // Stack teardown: the FIN exchange will never complete once the stack is
+    // gone, so cancel timers and drop the state machine's stack-side ref. The
+    // app's ref (if any) is not ours to release.
+    fn abort_external(ptr: *anyopaque) void {
+        const self: *TCPEndpoint = @ptrCast(@alignCast(ptr));
+        self.stack.timer_queue.cancel(&self.retransmit_timer);
+        self.stack.timer_queue.cancel(&self.time_wait_timer);
+        self.stack.timer_queue.cancel(&self.delayed_ack_timer);
+        self.state = .closed;
+        self.decStackRef();
     }
     pub fn incRef(self: *TCPEndpoint) void {
         self.ref_count += 1;

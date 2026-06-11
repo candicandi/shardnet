@@ -261,6 +261,10 @@ pub const TransportEndpoint = struct {
         incRef: *const fn (ptr: *anyopaque) void,
         decRef: *const fn (ptr: *anyopaque) void,
         notify: ?*const fn (ptr: *anyopaque, mask: waiter.EventMask) void = null,
+        // Stack-owned teardown: release refs the protocol state machine holds on
+        // behalf of the stack (not the app's ref). Called by Stack.deinit on
+        // endpoints still registered when the stack goes away.
+        abort: ?*const fn (ptr: *anyopaque) void = null,
     };
 
     pub fn handlePacket(self: TransportEndpoint, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void {
@@ -282,6 +286,12 @@ pub const TransportEndpoint = struct {
     pub fn notify(self: TransportEndpoint, mask: waiter.EventMask) void {
         if (self.vtable.notify) |f| {
             return f(self.ptr, mask);
+        }
+    }
+
+    pub fn abort(self: TransportEndpoint) void {
+        if (self.vtable.abort) |f| {
+            return f(self.ptr);
         }
     }
 };
@@ -648,6 +658,10 @@ pub const Stack = struct {
             var shard = &self.endpoints.shards[shard_idx];
             var it = shard.valueIterator();
             while (it.next()) |ep| {
+                // abort drops the protocol's stack-side ref; decRef drops the
+                // table's. Together they destroy endpoints whose connections
+                // never reached a terminal state.
+                ep.abort();
                 ep.decRef();
             }
             shard.clearAndFree();
@@ -783,8 +797,12 @@ pub const Stack = struct {
     }
 
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {
-        try self.endpoints.put(id, ep);
         ep.incRef();
+        errdefer ep.decRef();
+        // put() would silently replace an existing entry, stranding its ref —
+        // bind() then listen() register the same id, for example.
+        const old = try self.endpoints.getShard(id).fetchPut(id, ep);
+        if (old) |kv| kv.value.decRef();
     }
 
     pub fn unregisterTransportEndpoint(self: *Stack, id: TransportEndpointID) void {
