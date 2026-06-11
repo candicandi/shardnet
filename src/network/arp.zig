@@ -61,10 +61,9 @@ pub const CacheUpdatePolicy = enum {
 };
 
 pub const ARPProtocol = struct {
-    /// ARP cache: IPv4 address -> CacheEntry.
-    /// NOTE: Cache eviction uses LRU policy. When the cache is full, the oldest
-    /// entry (by timestamp) is evicted. Stale entries are refreshed on access
-    /// rather than eagerly, reducing background traffic.
+    // Secondary ARP cache. NOTE: currently unused by the RX path — passive
+    // learning writes to stack.link_addr_cache (the bounded, live cache). Kept
+    // for the explicit updateCache/policy API; wire it up or remove it.
     cache: std.AutoHashMap(tcpip.Address, CacheEntry),
     allocator: std.mem.Allocator,
     /// Policy for handling cache updates that would change an existing mapping.
@@ -220,6 +219,11 @@ pub const ARPProtocol = struct {
         if (ep_opt) |ep| {
             const arp_ep = @as(*ARPEndpoint, @ptrCast(@alignCast(ep.ptr)));
             if (!arp_ep.pending_requests.contains(addr)) {
+                // Bound the pending table; drop the longest-waiting request to
+                // make room (matches the documented "oldest is dropped" policy).
+                if (arp_ep.pending_requests.count() >= MAX_PENDING_REQUESTS) {
+                    arp_ep.dropOldestPending();
+                }
                 arp_ep.pending_requests.put(addr, std.time.milliTimestamp()) catch {};
                 if (!arp_ep.timer.active) {
                     nic.stack.timer_queue.schedule(&arp_ep.timer, 10);
@@ -369,6 +373,23 @@ pub const ARPEndpoint = struct {
         try self.sendGratuitousArp(addr);
     }
 
+    /// Evict the longest-waiting pending resolution to keep the table bounded.
+    fn dropOldestPending(self: *ARPEndpoint) void {
+        var oldest_key: ?tcpip.Address = null;
+        var oldest_ms: i64 = std.math.maxInt(i64);
+        var it = self.pending_requests.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* < oldest_ms) {
+                oldest_ms = entry.value_ptr.*;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+        if (oldest_key) |k| {
+            _ = self.pending_requests.remove(k);
+            stats.global_stats.arp.pending_drops.inc();
+        }
+    }
+
     pub fn handleTimer(ptr: *anyopaque) void {
         const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
         var it = self.pending_requests.iterator();
@@ -473,3 +494,85 @@ pub const ARPEndpoint = struct {
         }
     }
 };
+
+test "ARP pending-request cap and link-address cache bound" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn getMtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return stack.CapabilityNone;
+        }
+    }{};
+
+    const link_ep = stack.LinkEndpoint{
+        .ptr = &fake_link,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_link).writePacket,
+            .attach = @TypeOf(fake_link).attach,
+            .linkAddress = @TypeOf(fake_link).linkAddress,
+            .mtu = @TypeOf(fake_link).getMtu,
+            .setMTU = @TypeOf(fake_link).setMTU,
+            .capabilities = @TypeOf(fake_link).capabilities,
+        },
+    };
+
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+
+    // Register an ARP endpoint on the NIC; NIC.deinit closes it.
+    const ep = try allocator.create(ARPEndpoint);
+    ep.* = .{
+        .nic = nic,
+        .pending_requests = std.HashMap(tcpip.Address, i64, stack.Stack.AddressContext, 80).init(allocator),
+        .timer = time.Timer.init(ARPEndpoint.handleTimer, ep),
+    };
+    try nic.network_endpoints.put(ProtocolNumber, ep.networkEndpoint());
+
+    var proto = ARPProtocol.init(allocator);
+    defer proto.deinit();
+    const local = tcpip.Address{ .v4 = .{ 10, 0, 0, 1 } };
+
+    // Pending cap: one past MAX_PENDING_REQUESTS drops the longest-waiting entry.
+    const base_pending = stats.global_stats.arp.pending_drops.load();
+    var i: usize = 0;
+    while (i < MAX_PENDING_REQUESTS) : (i += 1) {
+        const target = tcpip.Address{ .v4 = .{ 10, 0, 1, @intCast(i) } };
+        try ARPProtocol.linkAddressRequest(&proto, target, local, nic);
+    }
+    try std.testing.expectEqual(MAX_PENDING_REQUESTS, @as(usize, ep.pending_requests.count()));
+
+    const overflow_target = tcpip.Address{ .v4 = .{ 10, 0, 2, 0 } };
+    try ARPProtocol.linkAddressRequest(&proto, overflow_target, local, nic);
+    try std.testing.expectEqual(MAX_PENDING_REQUESTS, @as(usize, ep.pending_requests.count()));
+    try std.testing.expect(ep.pending_requests.contains(overflow_target));
+    try std.testing.expectEqual(base_pending + 1, stats.global_stats.arp.pending_drops.load());
+
+    // Cache bound: one past MAX_LINK_ADDR_CACHE evicts an entry instead of growing.
+    const base_evict = stats.global_stats.arp.cache_evictions.load();
+    const mac = tcpip.LinkAddress{ .addr = [_]u8{ 1, 2, 3, 4, 5, 6 } };
+    var j: usize = 0;
+    while (j < stack.MAX_LINK_ADDR_CACHE) : (j += 1) {
+        const a = tcpip.Address{ .v4 = .{ 172, 16, @intCast(j >> 8), @intCast(j & 0xff) } };
+        try s.addLinkAddress(a, mac);
+    }
+    try std.testing.expectEqual(stack.MAX_LINK_ADDR_CACHE, @as(usize, s.link_addr_cache.count()));
+    try std.testing.expectEqual(base_evict, stats.global_stats.arp.cache_evictions.load());
+
+    try s.addLinkAddress(.{ .v4 = .{ 10, 9, 9, 9 } }, mac);
+    try std.testing.expectEqual(stack.MAX_LINK_ADDR_CACHE, @as(usize, s.link_addr_cache.count()));
+    try std.testing.expectEqual(base_evict + 1, stats.global_stats.arp.cache_evictions.load());
+    try std.testing.expect(s.link_addr_cache.get(.{ .v4 = .{ 10, 9, 9, 9 } }) != null);
+}

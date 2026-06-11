@@ -22,6 +22,9 @@ pub const CapabilityNone: LinkEndpointCapabilities = 0;
 pub const CapabilityLoopback: LinkEndpointCapabilities = 1 << 0;
 pub const CapabilityResolutionRequired: LinkEndpointCapabilities = 1 << 1;
 
+/// Upper bound on the link-address (ARP/NDP) cache to resist spoofed-reply floods.
+pub const MAX_LINK_ADDR_CACHE: usize = 4096;
+
 /// Stack configuration.
 pub const Config = struct {
     /// Maximum Segment Lifetime for TCP (milliseconds).
@@ -775,6 +778,21 @@ pub const Stack = struct {
         } else {
             is_new = true;
         }
+
+        // Bound the cache: ARP/NDP passive learning writes here on every valid
+        // packet, so spoofed replies from many source IPs would grow it without
+        // limit. Entries carry no timestamp, so evict an arbitrary one — under a
+        // flood it is most likely attacker junk, and a legitimate peer is
+        // re-learned on its next packet.
+        if (is_new and self.link_addr_cache.count() >= MAX_LINK_ADDR_CACHE) {
+            var it = self.link_addr_cache.keyIterator();
+            if (it.next()) |victim| {
+                const victim_key = victim.*;
+                _ = self.link_addr_cache.remove(victim_key);
+                stats.global_stats.arp.cache_evictions.inc();
+            }
+        }
+
         try self.link_addr_cache.put(addr, link_addr);
 
         // Drain ARP pending queue for this address

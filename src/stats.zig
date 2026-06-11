@@ -111,6 +111,8 @@ pub const ARPStatsSnapshot = struct {
     rx_replies: u64,
     tx_requests: u64,
     tx_replies: u64,
+    cache_evictions: u64,
+    pending_drops: u64,
 };
 
 pub const LinkStatsSnapshot = struct {
@@ -234,6 +236,8 @@ pub const ARPStats = struct {
     rx_replies: Counter = .{},
     tx_requests: Counter = .{},
     tx_replies: Counter = .{},
+    cache_evictions: Counter = .{},
+    pending_drops: Counter = .{},
 
     pub fn snapshot(self: *const ARPStats) ARPStatsSnapshot {
         return .{
@@ -241,6 +245,8 @@ pub const ARPStats = struct {
             .rx_replies = self.rx_replies.load(),
             .tx_requests = self.tx_requests.load(),
             .tx_replies = self.tx_replies.load(),
+            .cache_evictions = self.cache_evictions.load(),
+            .pending_drops = self.pending_drops.load(),
         };
     }
 
@@ -249,6 +255,8 @@ pub const ARPStats = struct {
         self.rx_replies.store(0);
         self.tx_requests.store(0);
         self.tx_replies.store(0);
+        self.cache_evictions.store(0);
+        self.pending_drops.store(0);
     }
 };
 
@@ -479,6 +487,8 @@ pub const StackStats = struct {
         try writer.print("net_arp_rx_replies_total{{iface=\"{s}\"}} {d}\n", .{ label, s.arp.rx_replies });
         try writer.print("net_arp_tx_requests_total{{iface=\"{s}\"}} {d}\n", .{ label, s.arp.tx_requests });
         try writer.print("net_arp_tx_replies_total{{iface=\"{s}\"}} {d}\n", .{ label, s.arp.tx_replies });
+        try writer.print("net_arp_cache_evictions_total{{iface=\"{s}\"}} {d}\n", .{ label, s.arp.cache_evictions });
+        try writer.print("net_arp_pending_drops_total{{iface=\"{s}\"}} {d}\n", .{ label, s.arp.pending_drops });
 
         // Direction metrics
         try writer.print("net_rx_bytes_total{{iface=\"{s}\"}} {d}\n", .{ label, s.direction.rx_bytes });
