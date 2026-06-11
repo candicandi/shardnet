@@ -25,6 +25,15 @@ pub const DEFAULT_TTL: u8 = 64;
 /// preventing memory exhaustion from fragment floods.
 pub const REASSEMBLY_TIMEOUT_MS: i64 = 30_000;
 
+/// Reassembly resource caps (RFC 791 §3.2 — reassembly memory MUST be bounded).
+/// Without these, a fragment flood exhausts the heap: one first-fragment per
+/// unique (src,dst,id,proto) inflates the context table, and many fragments per
+/// datagram inflate a single context. A legitimate 64 KiB datagram needs far
+/// fewer than these limits; anything past them is dropped (counted in stats).
+pub const MAX_REASSEMBLY_CONTEXTS: usize = 256;
+pub const MAX_FRAGMENTS_PER_DATAGRAM: usize = 128;
+pub const MAX_REASSEMBLY_BYTES: usize = 65_535;
+
 /// IP option types for options parsing.
 pub const OptionType = struct {
     pub const END_OF_OPTIONS: u8 = 0;
@@ -121,15 +130,23 @@ const ReassemblyContext = struct {
     fragments: std.ArrayList(Fragment),
     /// Timestamp when first fragment arrived (for expiry).
     first_arrival_ms: i64,
+    /// Running total of buffered payload bytes, for the per-datagram byte cap.
+    total_bytes: usize,
 
     pub fn init(allocator: std.mem.Allocator) ReassemblyContext {
         return .{
             .fragments = std.ArrayList(Fragment).init(allocator),
             .first_arrival_ms = std.time.milliTimestamp(),
+            .total_bytes = 0,
         };
     }
 
     pub fn deinit(self: *ReassemblyContext) void {
+        // Each fragment holds a cloned payload buffer; free those before the list
+        // itself, or expired/evicted contexts leak their fragment data.
+        for (self.fragments.items) |*f| {
+            f.data.data.deinit();
+        }
         self.fragments.deinit();
     }
 
@@ -359,6 +376,9 @@ pub const IPv4Endpoint = struct {
 
         var ctx_ptr = self.reassembly_list.getPtr(key);
         if (ctx_ptr == null) {
+            if (self.reassembly_list.count() >= MAX_REASSEMBLY_CONTEXTS) {
+                self.evictOldestReassembly();
+            }
             const ctx = ReassemblyContext.init(self.nic.stack.allocator);
             self.reassembly_list.put(key, ctx) catch return;
             ctx_ptr = self.reassembly_list.getPtr(key);
@@ -374,9 +394,22 @@ pub const IPv4Endpoint = struct {
             return;
         }
 
+        // A datagram exceeding these caps can never reassemble into a valid
+        // 64 KiB IPv4 packet — it is hostile or broken, so drop the whole context.
+        if (ctx.fragments.items.len >= MAX_FRAGMENTS_PER_DATAGRAM or
+            ctx.total_bytes + payload_pkt.data.size > MAX_REASSEMBLY_BYTES)
+        {
+            stats.global_stats.ip.reassembly_drops.inc();
+            if (self.reassembly_list.fetchRemove(key)) |kv| {
+                var removed = kv.value;
+                removed.deinit();
+            }
+            return;
+        }
+
         const cloned_data = payload_pkt.data.clone(self.nic.stack.allocator) catch return;
 
-        const fragment = Fragment{
+        var fragment = Fragment{
             .data = .{ .data = cloned_data, .header = undefined },
             .offset = h.fragmentOffset(),
             .more = h.moreFragments(),
@@ -384,7 +417,11 @@ pub const IPv4Endpoint = struct {
             .src = key.src,
             .dst = key.dst,
         };
-        ctx.fragments.append(fragment) catch return;
+        ctx.fragments.append(fragment) catch {
+            fragment.data.data.deinit();
+            return;
+        };
+        ctx.total_bytes += payload_pkt.data.size;
 
         const Sort = struct {
             fn less(context: void, a: Fragment, b: Fragment) bool {
@@ -394,12 +431,14 @@ pub const IPv4Endpoint = struct {
         };
         std.sort.block(Fragment, ctx.fragments.items, {}, Sort.less);
 
-        var expected_offset: u16 = 0;
+        // u32: offsets reach 65528 and a crafted final fragment could overflow a
+        // u16 accumulator, which panics in safe builds (remote crash vector).
+        var expected_offset: u32 = 0;
         var complete = true;
         var has_last = false;
 
         for (ctx.fragments.items) |f| {
-            const f_len = @as(u16, @intCast(f.data.data.size));
+            const f_len: u32 = @intCast(f.data.data.size);
             if (f.offset != expected_offset) {
                 complete = false;
                 break;
@@ -409,22 +448,24 @@ pub const IPv4Endpoint = struct {
         }
 
         if (complete and has_last) {
+            // Take ownership out of the table first: every exit below (including
+            // error returns) then frees the fragments exactly once via the defer,
+            // and no expiry/eviction path can see a half-consumed context.
+            var owned = (self.reassembly_list.fetchRemove(key) orelse return).value;
+            defer owned.deinit();
+
             var total_size: usize = 0;
-            for (ctx.fragments.items) |f| total_size += f.data.data.size;
+            for (owned.fragments.items) |f| total_size += f.data.data.size;
 
             const reassembled_buf = self.nic.stack.allocator.alloc(u8, total_size) catch return;
+            defer self.nic.stack.allocator.free(reassembled_buf);
             var offset: usize = 0;
-            for (ctx.fragments.items) |f| {
+            for (owned.fragments.items) |f| {
                 const v = f.data.data.toView(self.nic.stack.allocator) catch return;
                 defer self.nic.stack.allocator.free(v);
                 @memcpy(reassembled_buf[offset .. offset + v.len], v);
                 offset += v.len;
-                var mut_data = f.data.data;
-                mut_data.deinit();
             }
-
-            ctx.fragments.deinit();
-            _ = self.reassembly_list.remove(key);
 
             var views = [_]buffer.ClusterView{.{ .cluster = null, .view = reassembled_buf }};
             const reassembled_pkt = tcpip.PacketBuffer{
@@ -434,7 +475,6 @@ pub const IPv4Endpoint = struct {
 
             const p = h.protocol();
             self.dispatcher.deliverTransportPacket(r, p, reassembled_pkt);
-            self.nic.stack.allocator.free(reassembled_buf);
         }
     }
 
@@ -465,6 +505,29 @@ pub const IPv4Endpoint = struct {
                 ctx.deinit();
             }
             _ = self.reassembly_list.remove(key);
+            stats.global_stats.ip.reassembly_drops.inc();
+        }
+    }
+
+    // Capacity eviction: drop the longest-waiting reassembly. An attacker
+    // churning keys mostly evicts their own flood; a legitimate datagram
+    // completes in well under the 30s window.
+    fn evictOldestReassembly(self: *IPv4Endpoint) void {
+        var oldest_key: ?ReassemblyKey = null;
+        var oldest_ms: i64 = std.math.maxInt(i64);
+        var it = self.reassembly_list.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.first_arrival_ms < oldest_ms) {
+                oldest_ms = entry.value_ptr.first_arrival_ms;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+        if (oldest_key) |k| {
+            if (self.reassembly_list.fetchRemove(k)) |kv| {
+                var ctx = kv.value;
+                ctx.deinit();
+            }
+            stats.global_stats.ip.reassembly_drops.inc();
         }
     }
 
@@ -622,6 +685,159 @@ test "IPv4 fragmentation and reassembly" {
 
     try std.testing.expect(delivered);
     try std.testing.expectEqual(payload.len, delivered_len);
+}
+
+test "IPv4 reassembly caps: fragment count, byte budget, context eviction" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var fake_ep = struct {
+        mtu_val: u32 = 1500,
+        fn writePacket(ptr: *anyopaque, route: ?*const stack.Route, prot: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            _ = ptr;
+            _ = route;
+            _ = prot;
+            _ = pkt;
+            return;
+        }
+        fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
+            _ = ptr;
+            _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            _ = ptr;
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn getMtu(ptr: *anyopaque) u32 {
+            const self_ptr = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return self_ptr.mtu_val;
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void {
+            const self_ptr = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            self_ptr.mtu_val = m;
+        }
+        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities {
+            _ = ptr;
+            return stack.CapabilityNone;
+        }
+    }{ .mtu_val = 1500 };
+
+    const link_ep = stack.LinkEndpoint{
+        .ptr = &fake_ep,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_ep).writePacket,
+            .attach = @TypeOf(fake_ep).attach,
+            .linkAddress = @TypeOf(fake_ep).linkAddress,
+            .mtu = @TypeOf(fake_ep).getMtu,
+            .setMTU = @TypeOf(fake_ep).setMTU,
+            .capabilities = @TypeOf(fake_ep).capabilities,
+        },
+    };
+
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+    const ipv4_proto = IPv4Protocol.init();
+
+    var delivered = false;
+    const FakeDispatcher = struct {
+        delivered: *bool,
+        fn deliverTransportPacket(ptr: *anyopaque, route: *const stack.Route, prot: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
+            const self_ptr = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            _ = route;
+            _ = prot;
+            _ = pkt;
+            self_ptr.delivered.* = true;
+        }
+    };
+    var fd = FakeDispatcher{ .delivered = &delivered };
+    const dispatcher = stack.TransportDispatcher{
+        .ptr = &fd,
+        .vtable = &.{
+            .deliverTransportPacket = FakeDispatcher.deliverTransportPacket,
+        },
+    };
+
+    var ep_ipv4 = try nic.stack.allocator.create(IPv4Endpoint);
+    ep_ipv4.* = .{
+        .nic = nic,
+        .address = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .protocol = @constCast(&ipv4_proto),
+        .dispatcher = dispatcher,
+        .reassembly_list = std.AutoHashMap(ReassemblyKey, ReassemblyContext).init(allocator),
+    };
+    defer {
+        var drain = ep_ipv4.reassembly_list.valueIterator();
+        while (drain.next()) |c| c.deinit();
+        ep_ipv4.reassembly_list.deinit();
+        nic.stack.allocator.destroy(ep_ipv4);
+    }
+
+    const route = stack.Route{
+        .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .remote_address = .{ .v4 = .{ 10, 0, 0, 2 } },
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+
+    const F = struct {
+        fn feed(ep: *IPv4Endpoint, r: *const stack.Route, alloc: std.mem.Allocator, id: u16, offset_units: u16, mf: bool, payload_len: usize) !void {
+            const buf = try alloc.alloc(u8, header.IPv4MinimumSize + payload_len);
+            defer alloc.free(buf);
+            @memset(buf, 0);
+            var h = header.IPv4.init(buf);
+            h.data[0] = 0x45;
+            std.mem.writeInt(u16, h.data[2..4][0..2], @as(u16, @intCast(header.IPv4MinimumSize + payload_len)), .big);
+            std.mem.writeInt(u16, h.data[4..6][0..2], id, .big);
+            std.mem.writeInt(u16, h.data[6..8][0..2], (if (mf) @as(u16, 0x2000) else @as(u16, 0)) | offset_units, .big);
+            h.data[8] = 64;
+            h.data[9] = 17;
+            @memcpy(h.data[12..16], &[_]u8{ 10, 0, 0, 2 });
+            @memcpy(h.data[16..20], &[_]u8{ 10, 0, 0, 1 });
+            h.setChecksum(h.calculateChecksum());
+            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = buf }};
+            const pkt = tcpip.PacketBuffer{
+                .data = buffer.VectorisedView.init(buf.len, &views),
+                .header = undefined,
+            };
+            ep.networkEndpoint().handlePacket(r, pkt);
+        }
+    };
+
+    // Fragment-count cap: the datagram is dropped wholesale one past the limit.
+    var base = stats.global_stats.ip.reassembly_drops.load();
+    var i: u16 = 0;
+    while (i < MAX_FRAGMENTS_PER_DATAGRAM) : (i += 1) {
+        try F.feed(ep_ipv4, &route, allocator, 7, i, true, 8);
+    }
+    try std.testing.expectEqual(@as(usize, 1), @as(usize, ep_ipv4.reassembly_list.count()));
+    try F.feed(ep_ipv4, &route, allocator, 7, i, true, 8);
+    try std.testing.expectEqual(@as(usize, 0), @as(usize, ep_ipv4.reassembly_list.count()));
+    try std.testing.expectEqual(base + 1, stats.global_stats.ip.reassembly_drops.load());
+
+    // Byte budget: buffered payload may never exceed a valid IPv4 datagram.
+    base = stats.global_stats.ip.reassembly_drops.load();
+    try F.feed(ep_ipv4, &route, allocator, 8, 0, true, 60000);
+    try std.testing.expectEqual(@as(usize, 1), @as(usize, ep_ipv4.reassembly_list.count()));
+    try F.feed(ep_ipv4, &route, allocator, 8, 7500, false, 6000);
+    try std.testing.expectEqual(@as(usize, 0), @as(usize, ep_ipv4.reassembly_list.count()));
+    try std.testing.expectEqual(base + 1, stats.global_stats.ip.reassembly_drops.load());
+
+    // Context cap: table is bounded; overflow evicts the oldest reassembly.
+    base = stats.global_stats.ip.reassembly_drops.load();
+    var id: u16 = 1000;
+    while (id < 1000 + MAX_REASSEMBLY_CONTEXTS) : (id += 1) {
+        try F.feed(ep_ipv4, &route, allocator, id, 0, true, 8);
+    }
+    try std.testing.expectEqual(MAX_REASSEMBLY_CONTEXTS, @as(usize, ep_ipv4.reassembly_list.count()));
+    try std.testing.expectEqual(base, stats.global_stats.ip.reassembly_drops.load());
+    try F.feed(ep_ipv4, &route, allocator, 9999, 0, true, 8);
+    try std.testing.expectEqual(MAX_REASSEMBLY_CONTEXTS, @as(usize, ep_ipv4.reassembly_list.count()));
+    try std.testing.expectEqual(base + 1, stats.global_stats.ip.reassembly_drops.load());
+
+    // Nothing should ever have been delivered up the stack.
+    try std.testing.expect(!delivered);
 }
 
 test "IPv4 options parsing" {

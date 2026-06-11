@@ -90,6 +90,7 @@ pub const IPStatsSnapshot = struct {
     dropped_packets: u64,
     invalid_checksum: u64,
     no_route: u64,
+    reassembly_drops: u64,
 };
 
 pub const TCPStatsSnapshot = struct {
@@ -129,6 +130,7 @@ pub const IPStats = struct {
     dropped_packets: Counter = .{},
     invalid_checksum: Counter = .{},
     no_route: Counter = .{},
+    reassembly_drops: Counter = .{},
 
     pub fn snapshot(self: *const IPStats) IPStatsSnapshot {
         return .{
@@ -137,6 +139,7 @@ pub const IPStats = struct {
             .dropped_packets = self.dropped_packets.load(),
             .invalid_checksum = self.invalid_checksum.load(),
             .no_route = self.no_route.load(),
+            .reassembly_drops = self.reassembly_drops.load(),
         };
     }
 
@@ -146,6 +149,7 @@ pub const IPStats = struct {
         self.dropped_packets.store(0);
         self.invalid_checksum.store(0);
         self.no_route.store(0);
+        self.reassembly_drops.store(0);
     }
 };
 
@@ -457,6 +461,7 @@ pub const StackStats = struct {
         try writer.print("net_ip_dropped_packets_total{{iface=\"{s}\"}} {d}\n", .{ label, s.ip.dropped_packets });
         try writer.print("net_ip_invalid_checksum_total{{iface=\"{s}\"}} {d}\n", .{ label, s.ip.invalid_checksum });
         try writer.print("net_ip_no_route_total{{iface=\"{s}\"}} {d}\n", .{ label, s.ip.no_route });
+        try writer.print("net_ip_reassembly_drops_total{{iface=\"{s}\"}} {d}\n", .{ label, s.ip.reassembly_drops });
 
         // TCP metrics
         try writer.print("net_tcp_rx_segments_total{{iface=\"{s}\"}} {d}\n", .{ label, s.tcp.rx_segments });
