@@ -71,12 +71,13 @@ pub fn build(b: *std.Build) void {
     // Discover *_test.zig files under src/ and compile each as a standalone
     // test artifact so zig build test exercises every test in the tree.
     // Platform-agnostic test files. `run = false` marks files that are compiled
-    // (so they stay type-checked) but not executed because they currently crash on
-    // a double-free in TCP endpoint teardown that corrupts the heap. Flip to true
-    // once that is fixed.
+    // (so they stay type-checked) but not executed: tcp_test endpoints leak their
+    // stack/table refs when a connection can't finish its FIN exchange (listener
+    // and connected endpoints are never destroyed), which trips the testing
+    // allocator. Flip to true once endpoint ref accounting is fixed.
     const test_files = [_]struct { path: []const u8, run: bool }{
         .{ .path = "src/transport/tcp_test.zig", .run = false },
-        .{ .path = "src/transport/tcp_2msl_test.zig", .run = false },
+        .{ .path = "src/transport/tcp_2msl_test.zig", .run = true },
     };
 
     for (test_files) |tf| {
