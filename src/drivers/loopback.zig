@@ -2,6 +2,7 @@ const std = @import("std");
 const stack = @import("../stack.zig");
 const tcpip = @import("../tcpip.zig");
 const buffer = @import("../buffer.zig");
+const header = @import("../header.zig");
 const log = @import("../log.zig").scoped(.loopback);
 
 /// A virtual link-layer endpoint that delivers packets back to the same
@@ -35,6 +36,10 @@ pub const Loopback = struct {
     // in the common case, which matters for high-throughput loopback tests.
     node_pool: NodePool,
 
+    // Linearised packets are copied into ref-counted clusters so the receive
+    // path's shallow clone (cloneInPool) keeps the bytes alive until it is done.
+    cluster_pool: buffer.ClusterPool,
+
     // NOTE: Simulation knobs are set at init time. Keeping them immutable
     // after construction lets the compiler hoist the zero-checks in tick()
     // and writePacket() when the values are comptime-known zero.
@@ -53,6 +58,9 @@ pub const Loopback = struct {
 
     const Packet = struct {
         protocol: tcpip.NetworkProtocolNumber,
+        /// The delivered packet: a single cluster-backed view holding the
+        /// linearised L3 header + payload, so the RX path reads headers from the
+        /// data view (as it would off a real wire).
         pkt: tcpip.PacketBuffer,
         /// Monotonic wall-clock timestamp (nanoseconds) captured at enqueue
         /// time. Used together with `delay_ns` to hold packets in the queue
@@ -126,6 +134,7 @@ pub const Loopback = struct {
             .queue = .{},
             .allocator = allocator,
             .node_pool = NodePool.init(allocator, config.node_pool_capacity),
+            .cluster_pool = buffer.ClusterPool.init(allocator),
             .delay_ns = config.delay_ns,
             .loss_pct = config.loss_pct,
             .prng = std.Random.DefaultPrng.init(config.prng_seed),
@@ -137,14 +146,14 @@ pub const Loopback = struct {
     /// Any packets still sitting in the queue are drained and freed so that
     /// the backing allocator sees a clean shutdown (no leaks).
     pub fn deinit(self: *Loopback) void {
-        // NOTE: We must drain the queue before tearing down the pool,
-        // because each queued packet holds a cloned VectorisedView that
-        // owns cluster references.
+        // Drain the queue before tearing down the pools; each undelivered packet
+        // still holds a cluster reference and its views array.
         while (self.queue.popFirst()) |node| {
             node.data.pkt.data.deinit();
             self.node_pool.release(node);
         }
         self.node_pool.deinit();
+        self.cluster_pool.deinit();
     }
 
     /// Return a point-in-time snapshot of the driver counters.
@@ -210,7 +219,7 @@ pub const Loopback = struct {
         // NOTE: Loss is evaluated before cloning or pooling so that dropped
         // packets never consume pool nodes or trigger a buffer clone.
         if (self.loss_pct > 0) {
-            const roll = self.prng.random().intRangeLessThan(u8, 100);
+            const roll = self.prng.random().intRangeLessThan(u8, 0, 100);
             if (roll < self.loss_pct) {
                 self.loopback_dropped += 1;
                 log.debug("Loopback: Dropping packet proto=0x{x} (loss simulation)", .{protocol});
@@ -218,16 +227,50 @@ pub const Loopback = struct {
             }
         }
 
-        // PERF: Acquire a queue node from the pool instead of the backing
-        // allocator. Under steady-state traffic the pool satisfies every
-        // request without allocation.
-        const node = self.node_pool.acquire() catch return tcpip.Error.OutOfMemory;
+        // Linearise the prepended header and payload into one contiguous buffer
+        // so the delivered packet's data view starts with the L3 header — exactly
+        // how the bytes arrive off a real wire, which is where the RX path reads
+        // headers from. (The TX path writes headers into the Prependable, not data.)
+        // Linearise the prepended header and payload into one ref-counted cluster
+        // so the delivered data view starts with the L3 header (where the RX path
+        // reads it) and stays alive through the receiver's shallow clone.
+        const hdr = pkt.header.view();
+        const total = hdr.len + pkt.data.size;
+        if (total > header.ClusterSize) return tcpip.Error.MessageTooLong;
+        const cluster = self.cluster_pool.acquire() catch return tcpip.Error.OutOfMemory;
+        @memcpy(cluster.data[0..hdr.len], hdr);
+        // Copy exactly `data.size` payload bytes: a view's backing slice can be
+        // longer than the logical size, so clamp per view.
+        var off = hdr.len;
+        var remaining = pkt.data.size;
+        for (pkt.data.views) |v| {
+            if (remaining == 0) break;
+            const n = @min(v.view.len, remaining);
+            @memcpy(cluster.data[off .. off + n], v.view[0..n]);
+            off += n;
+            remaining -= n;
+        }
+
+        const views = self.allocator.alloc(buffer.ClusterView, 1) catch {
+            cluster.release();
+            return tcpip.Error.NoBufferSpace;
+        };
+        views[0] = .{ .cluster = cluster, .view = cluster.data[0..total] };
+        const wire = buffer.VectorisedView{
+            .views = views,
+            .original_views = views,
+            .size = total,
+            .allocator = self.allocator,
+        };
+
+        const node = self.node_pool.acquire() catch {
+            var w = wire;
+            w.deinit();
+            return tcpip.Error.OutOfMemory;
+        };
         node.data = .{
             .protocol = protocol,
-            .pkt = pkt.clone(self.allocator) catch {
-                self.node_pool.release(node);
-                return tcpip.Error.NoBufferSpace;
-            },
+            .pkt = .{ .data = wire, .header = buffer.Prependable.init(&[_]u8{}) },
             .enqueue_ts = std.time.nanoTimestamp(),
         };
         self.queue.append(node);
@@ -259,10 +302,8 @@ pub const Loopback = struct {
             }
             self.loopback_rx += 1;
 
-            // NOTE: The cloned packet's VectorisedView must be released after the
-            // dispatcher has finished reading, ensuring the buffer cannot be reused
-            // until the receive handler completes. This completes the buffer safety
-            // guarantee established by the clone() in writePacket().
+            // Release our cluster reference; the receiver's shallow clone holds
+            // its own reference, so the bytes survive until it is finished.
             node.data.pkt.data.deinit();
             // PERF: Return the node to the pool rather than freeing it,
             // keeping the next writePacket allocation off the heap.
