@@ -149,6 +149,7 @@ test "TCP RFC 1337 RST in TIME_WAIT ignored" {
     var wq_client = waiter.Queue{};
     const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
     const ep_client: *TCPEndpoint = @ptrCast(@alignCast(ep_client_res.ptr));
+    defer ep_client.close();
 
     // Set up endpoint in TIME_WAIT
     ep_client.state = .time_wait;
@@ -211,6 +212,7 @@ test "TCP TIME_WAIT reuse with new SYN" {
     var wq_client = waiter.Queue{};
     const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
     const ep_client: *TCPEndpoint = @ptrCast(@alignCast(ep_client_res.ptr));
+    defer ep_client.close();
 
     // Set up endpoint in TIME_WAIT
     ep_client.state = .time_wait;
@@ -295,6 +297,7 @@ test "TCP connection rejected during TIME_WAIT on same 4-tuple" {
     var wq1 = waiter.Queue{};
     const ep1_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq1);
     const ep1: *TCPEndpoint = @ptrCast(@alignCast(ep1_res.ptr));
+    defer ep1.close();
     ep1.state = .time_wait;
     ep1.local_addr = local_addr;
     ep1.remote_addr = remote_addr;
@@ -317,7 +320,8 @@ test "TCP connection rejected during TIME_WAIT on same 4-tuple" {
     try ep2.endpoint().bind(local_addr);
     try std.testing.expectEqual(EndpointState.bound, ep2.state);
 
-    // But the TIME_WAIT endpoint should still be registered
-    try std.testing.expect(s.endpoints.get(id) != null);
-    if (s.endpoints.get(id)) |e| e.decRef();
+    // But the TIME_WAIT endpoint should still be registered (get() incRefs; balance it)
+    const reg = s.endpoints.get(id);
+    try std.testing.expect(reg != null);
+    if (reg) |e| e.decRef();
 }
