@@ -184,7 +184,12 @@ pub const TCP = struct {
         sum += (@as(u16, dst[0]) << 8) | dst[1];
         sum += (@as(u16, dst[2]) << 8) | dst[3];
         sum += 6; // Protocol TCP
-        sum += @as(u16, @intCast(self.data.len + payload.len));
+        // Fold the pseudo-header length as 32-bit. A plain @intCast to u16 panics
+        // in safe builds when an oversize/malformed segment pushes the total past
+        // 65535 — a remote crash. Folding yields a (wrong) checksum instead, so the
+        // packet is rejected; for valid segments (len <= 65535) it is identical.
+        const seg_len: u32 = @truncate(self.data.len + payload.len);
+        sum += (seg_len >> 16) + (seg_len & 0xffff);
 
         sum = internetChecksum(self.data, sum);
         sum = internetChecksum(payload, sum);
@@ -198,7 +203,9 @@ pub const TCP = struct {
         sum += (@as(u16, dst[0]) << 8) | dst[1];
         sum += (@as(u16, dst[2]) << 8) | dst[3];
         sum += 6; // Protocol TCP
-        sum += @as(u16, @intCast(self.data.len + payload.size));
+        // See calculateChecksum: fold length as 32-bit to avoid a panic on oversize input.
+        const seg_len: u32 = @truncate(self.data.len + payload.size);
+        sum += (seg_len >> 16) + (seg_len & 0xffff);
 
         sum = internetChecksum(self.data, sum);
         for (payload.views) |v| {
@@ -470,7 +477,12 @@ pub const UDP = struct {
         sum += std.mem.readInt(u16, dst[0..2], .big);
         sum += std.mem.readInt(u16, dst[2..4], .big);
         sum += 17; // Protocol UDP
-        sum += @as(u16, @intCast(self.data.len + payload.len));
+        // Fold the pseudo-header length as 32-bit. A plain @intCast to u16 panics
+        // in safe builds when an oversize/malformed segment pushes the total past
+        // 65535 — a remote crash. Folding yields a (wrong) checksum instead, so the
+        // packet is rejected; for valid segments (len <= 65535) it is identical.
+        const seg_len: u32 = @truncate(self.data.len + payload.len);
+        sum += (seg_len >> 16) + (seg_len & 0xffff);
 
         sum = internetChecksum(self.data, sum);
         sum = internetChecksum(payload, sum);
@@ -900,6 +912,45 @@ test "Checksum calculation" {
     const c = internetChecksum(&data, 0);
     const expected: u16 = 0xb1e6; // Precalculated for this header
     try std.testing.expectEqual(expected, finishChecksum(c));
+}
+
+test "TCP/UDP checksum length fold does not panic on oversize payload" {
+    const allocator = std.testing.allocator;
+    const src = [_]u8{ 10, 0, 0, 1 };
+    const dst = [_]u8{ 10, 0, 0, 2 };
+
+    var tcp_buf: [TCPMinimumSize]u8 = undefined;
+    @memset(&tcp_buf, 0);
+    const tcp = TCP.init(&tcp_buf);
+
+    var udp_buf: [UDPMinimumSize]u8 = undefined;
+    @memset(&udp_buf, 0);
+    const udp = UDP.init(&udp_buf);
+
+    // Valid size: the folded length must match the old `@intCast(len)` exactly.
+    {
+        const payload = [_]u8{ 1, 2, 3, 4 };
+        var sum: u32 = 0;
+        sum += (@as(u16, src[0]) << 8) | src[1];
+        sum += (@as(u16, src[2]) << 8) | src[3];
+        sum += (@as(u16, dst[0]) << 8) | dst[1];
+        sum += (@as(u16, dst[2]) << 8) | dst[3];
+        sum += 6;
+        sum += @as(u16, @intCast(tcp_buf.len + payload.len)); // old formula
+        sum = internetChecksum(&tcp_buf, sum);
+        sum = internetChecksum(&payload, sum);
+        try std.testing.expectEqual(finishChecksum(sum), tcp.calculateChecksum(src, dst, &payload));
+    }
+
+    // Oversize payload (> 65535): the old @intCast(u16) panicked here. The fold
+    // must return a value without crashing.
+    {
+        const big = try allocator.alloc(u8, 70000);
+        defer allocator.free(big);
+        @memset(big, 0);
+        _ = tcp.calculateChecksum(src, dst, big);
+        _ = udp.calculateChecksum(src, dst, big);
+    }
 }
 
 test "Checksum SIMD vs Scalar comparison" {
