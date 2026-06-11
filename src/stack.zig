@@ -417,7 +417,9 @@ pub const NIC = struct {
         }
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
 
-        if (remote.eq(self.linkEP.linkAddress())) return;
+        // A real NIC hears its own link-layer broadcasts and must drop them; a
+        // loopback NIC delivers self-addressed traffic by design.
+        if (!self.loopback and remote.eq(self.linkEP.linkAddress())) return;
 
         const proto_opt = self.stack.network_protocols.get(protocol);
         if (proto_opt == null) return;
@@ -917,8 +919,18 @@ pub const Stack = struct {
     }
 
     pub fn createNIC(self: *Stack, id: tcpip.NICID, ep: LinkEndpoint) !void {
+        return self.createNICEx(id, ep, false);
+    }
+
+    /// Create a loopback NIC, which delivers self-addressed traffic (the NIC
+    /// dispatch skips the "drop our own link-layer broadcast" guard).
+    pub fn createLoopbackNIC(self: *Stack, id: tcpip.NICID, ep: LinkEndpoint) !void {
+        return self.createNICEx(id, ep, true);
+    }
+
+    pub fn createNICEx(self: *Stack, id: tcpip.NICID, ep: LinkEndpoint, loopback: bool) !void {
         const nic = try self.allocator.create(NIC);
-        nic.* = NIC.init(self, id, "", ep, false);
+        nic.* = NIC.init(self, id, "", ep, loopback);
 
         try self.nics.put(id, nic);
 
