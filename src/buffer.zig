@@ -86,6 +86,11 @@ pub const ClusterPool = struct {
             self.free_list = c.next;
             if (self.count > 0) self.count -= 1;
             c.ref_count = 1;
+            // The pool may have moved since prewarm (Stack.initWithConfig prewarms a
+            // local pool, then returns it by value), so the back-pointer stamped at
+            // prewarm time can dangle. Re-stamp it with the live address on every
+            // acquire or release() pushes onto a phantom free list through dead stack.
+            c.pool = self;
             return c;
         }
 
