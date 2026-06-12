@@ -239,12 +239,57 @@ pub const ICMPv4PacketHandler = struct {
         }
     }
 
+    // RFC 1191 section 7.1 plateau table, for routers that send MTU=0.
+    const mtu_plateaus = [_]u16{ 65535, 32000, 17914, 8166, 4352, 2002, 1492, 1006, 508, 296, 68 };
+
+    fn plateauBelow(total_len: u16) u32 {
+        for (mtu_plateaus) |p| {
+            if (p < total_len) return p;
+        }
+        return 68;
+    }
+
     fn handleDestUnreachable(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
-        _ = s;
         if (v.len < 8) return;
         const code = v[1];
         log.debug("Destination Unreachable code {} from {any}", .{ code, r.remote_address.v4 });
-        // NOTE: Would notify upper layers (TCP/UDP) about unreachable destination
+
+        // The error embeds the original IP header + >=8 payload bytes (RFC 792).
+        if (v.len < 8 + header.IPv4MinimumSize) return;
+        const orig = v[8..];
+        if ((orig[0] >> 4) != 4) return;
+        const orig_src = tcpip.Address{ .v4 = orig[12..16].* };
+        const orig_dst = tcpip.Address{ .v4 = orig[16..20].* };
+        // Only honor errors about packets we could actually have sent — the
+        // cheap RFC 5927 check against off-path spoofing.
+        if (!s.hasLocalAddress(orig_src)) return;
+
+        if (code == DestUnreachableCode.FRAGMENTATION_NEEDED) {
+            var mtu_val: u32 = std.mem.readInt(u16, v[6..8], .big);
+            if (mtu_val == 0) mtu_val = plateauBelow(std.mem.readInt(u16, orig[2..4], .big));
+            mtu_val = @max(mtu_val, 68);
+            s.updatePMTU(orig_dst, mtu_val);
+            return;
+        }
+
+        notifyTransportError(s, orig);
+    }
+
+    fn notifyTransportError(s: *stack.Stack, orig: []const u8) void {
+        const ihl: usize = @as(usize, orig[0] & 0x0f) * 4;
+        if (ihl < header.IPv4MinimumSize or orig.len < ihl + 4) return;
+        const ports = orig[ihl..];
+        // The embedded packet was outbound, so its source is our local side.
+        const id = stack.TransportEndpointID{
+            .local_port = std.mem.readInt(u16, ports[0..2], .big),
+            .local_address = .{ .v4 = orig[12..16].* },
+            .remote_port = std.mem.readInt(u16, ports[2..4], .big),
+            .remote_address = .{ .v4 = orig[16..20].* },
+        };
+        if (s.endpoints.get(id)) |ep| {
+            ep.notify(waiter.EventErr);
+            ep.decRef();
+        }
     }
 
     fn handleRedirect(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
@@ -449,6 +494,62 @@ pub const ICMPv4Endpoint = struct {
         ICMPv4PacketHandler.handlePacket(self.nic.stack, r, pkt);
     }
 };
+
+test "ICMP fragmentation needed updates the PMTU cache" {
+    const loopback = @import("../drivers/loopback.zig");
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var lo = loopback.Loopback.init(allocator);
+    defer lo.deinit();
+    try s.createLoopbackNIC(1, lo.linkEndpoint());
+    const nic = s.nics.get(1).?;
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = .{ 10, 0, 0, 1 } }, .prefix_len = 24 } });
+
+    const r = stack.Route{
+        .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .remote_address = .{ .v4 = .{ 203, 0, 113, 1 } },
+        .local_link_address = lo.linkEndpoint().linkAddress(),
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+
+    var msg = [_]u8{0} ** (8 + 28);
+    msg[0] = Type.DEST_UNREACHABLE;
+    msg[1] = DestUnreachableCode.FRAGMENTATION_NEEDED;
+    msg[8] = 0x45;
+    std.mem.writeInt(u16, msg[10..12], 1500, .big); // embedded total length
+    msg[20..24].* = .{ 10, 0, 0, 1 }; // embedded src: ours
+    msg[24..28].* = .{ 192, 0, 2, 7 }; // embedded dst: the path target
+    const path_dst = tcpip.Address{ .v4 = .{ 192, 0, 2, 7 } };
+
+    const feed = struct {
+        fn run(st: *stack.Stack, route: *const stack.Route, bytes: []const u8) void {
+            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(bytes) }};
+            const pkt = tcpip.PacketBuffer{
+                .data = buffer.VectorisedView.init(bytes.len, &views),
+                .header = buffer.Prependable.init(&[_]u8{}),
+            };
+            ICMPv4PacketHandler.handlePacket(st, route, pkt);
+        }
+    }.run;
+
+    // MTU field of 0: fall back to the next plateau below the embedded length.
+    feed(&s, &r, &msg);
+    try std.testing.expectEqual(@as(?u32, 1492), s.pmtuFor(path_dst));
+
+    // Explicit next-hop MTU shrinks the entry.
+    std.mem.writeInt(u16, msg[6..8], 1400, .big);
+    feed(&s, &r, &msg);
+    try std.testing.expectEqual(@as(?u32, 1400), s.pmtuFor(path_dst));
+
+    // An error about a packet we never sent (foreign source) is ignored.
+    msg[20..24].* = .{ 10, 0, 0, 99 };
+    std.mem.writeInt(u16, msg[6..8], 600, .big);
+    feed(&s, &r, &msg);
+    try std.testing.expectEqual(@as(?u32, 1400), s.pmtuFor(path_dst));
+}
 
 test "ICMP rate limiter" {
     var limiter = RateLimiter.init();
