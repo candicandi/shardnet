@@ -476,14 +476,21 @@ pub const IPv4Endpoint = struct {
                 offset += v.len;
             }
 
-            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = reassembled_buf }};
+            // Receivers shallow-clone (cloneInPool acquires clusters, not bytes),
+            // so the delivered view must be cluster-backed, not this frame's buffer.
+            var wire = buffer.VectorisedView.fromSlice(
+                reassembled_buf,
+                self.nic.stack.allocator,
+                &self.nic.stack.cluster_pool,
+            ) catch return;
             const reassembled_pkt = tcpip.PacketBuffer{
-                .data = buffer.VectorisedView.init(total_size, &views),
-                .header = undefined,
+                .data = wire,
+                .header = buffer.Prependable.init(&[_]u8{}),
             };
 
             const p = h.protocol();
             self.dispatcher.deliverTransportPacket(r, p, reassembled_pkt);
+            wire.deinit();
         }
     }
 
