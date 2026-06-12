@@ -595,6 +595,7 @@ pub const IPv6 = struct {
 };
 
 pub const ICMPv6MinimumSize = 4;
+pub const ICMPv6PacketTooBigType = 2;
 pub const ICMPv6EchoRequestType = 128;
 pub const ICMPv6EchoReplyType = 129;
 pub const ICMPv6RouterSolicitationType = 133;

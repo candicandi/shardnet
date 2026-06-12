@@ -137,6 +137,9 @@ pub const ICMPv6PacketHandler = struct {
         stats.global_stats.icmpv6.rx_packets.inc();
 
         switch (h.type()) {
+            header.ICMPv6PacketTooBigType => {
+                handlePacketTooBig(s, v);
+            },
             header.ICMPv6EchoRequestType => {
                 stats.global_stats.icmpv6.rx_echo_requests.inc();
                 handleEchoRequest(s, r, v);
@@ -172,6 +175,21 @@ pub const ICMPv6PacketHandler = struct {
                 log.debug("Unknown ICMPv6 type: {}", .{h.type()});
             },
         }
+    }
+
+    fn handlePacketTooBig(s: *stack.Stack, v: []const u8) void {
+        // type(1) code(1) checksum(2) MTU(4), then the original packet (RFC 4443).
+        if (v.len < 8 + header.IPv6MinimumSize) return;
+        const orig = v[8..];
+        if ((orig[0] >> 4) != 6) return;
+        const orig_src = tcpip.Address{ .v6 = orig[8..24].* };
+        const orig_dst = tcpip.Address{ .v6 = orig[24..40].* };
+        // Only honor errors about packets we could actually have sent — the
+        // cheap RFC 5927 check against off-path spoofing.
+        if (!s.hasLocalAddress(orig_src)) return;
+        // RFC 8201: never below the IPv6 minimum link MTU.
+        const mtu_val = @max(std.mem.readInt(u32, v[4..8], .big), 1280);
+        s.updatePMTU(orig_dst, mtu_val);
     }
 
     fn handleEchoRequest(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
@@ -703,4 +721,63 @@ test "ICMPv6 Router Advertisement & SLAAC" {
         }
     }
     try std.testing.expect(found_default);
+}
+
+test "ICMPv6 Packet Too Big updates the PMTU cache" {
+    const loopback = @import("../drivers/loopback.zig");
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var lo = loopback.Loopback.init(allocator);
+    defer lo.deinit();
+    try s.createLoopbackNIC(1, lo.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const my_addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1};
+    const dst_addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{2};
+    try nic.addAddress(.{ .protocol = 0x86dd, .address_with_prefix = .{ .address = .{ .v6 = my_addr }, .prefix_len = 64 } });
+
+    const r = stack.Route{
+        .local_address = .{ .v6 = my_addr },
+        .remote_address = .{ .v6 = dst_addr },
+        .local_link_address = lo.linkEndpoint().linkAddress(),
+        .net_proto = 0x86dd,
+        .nic = nic,
+    };
+
+    var msg = [_]u8{0} ** (8 + 40);
+    msg[0] = header.ICMPv6PacketTooBigType;
+    std.mem.writeInt(u32, msg[4..8], 1300, .big);
+    msg[8] = 0x60;
+    msg[16..32].* = my_addr; // embedded src: ours
+    msg[32..48].* = dst_addr; // embedded dst: the path target
+
+    const feed = struct {
+        fn run(st: *stack.Stack, route: *const stack.Route, bytes: []const u8) void {
+            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(bytes) }};
+            const pkt = tcpip.PacketBuffer{
+                .data = buffer.VectorisedView.init(bytes.len, &views),
+                .header = buffer.Prependable.init(&[_]u8{}),
+            };
+            ICMPv6PacketHandler.handlePacket(st, route, pkt);
+        }
+    }.run;
+
+    feed(&s, &r, &msg);
+    try std.testing.expectEqual(@as(?u32, 1300), s.pmtuFor(.{ .v6 = dst_addr }));
+
+    // Reported MTU below the IPv6 minimum link MTU is clamped to 1280.
+    std.mem.writeInt(u32, msg[4..8], 600, .big);
+    feed(&s, &r, &msg);
+    try std.testing.expectEqual(@as(?u32, 1280), s.pmtuFor(.{ .v6 = dst_addr }));
+
+    // An error about a packet we never sent (foreign source) is ignored:
+    // no entry may appear for its destination.
+    const other_dst = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{3};
+    msg[16..32].* = dst_addr;
+    msg[32..48].* = other_dst;
+    std.mem.writeInt(u32, msg[4..8], 1400, .big);
+    feed(&s, &r, &msg);
+    try std.testing.expectEqual(@as(?u32, null), s.pmtuFor(.{ .v6 = other_dst }));
 }
