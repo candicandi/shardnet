@@ -131,6 +131,20 @@ pub const Socket = struct {
     pub fn peerAddr(self: *Socket) Error!tcpip.FullAddress {
         return self.ep.getRemoteAddress();
     }
+
+    /// Set a socket option, e.g. `.{ .tcp_nodelay = true }`.
+    pub fn setOption(self: *Socket, opt: tcpip.EndpointOption) Error!void {
+        return self.ep.setOption(opt);
+    }
+    pub fn getOption(self: *Socket, opt_type: tcpip.EndpointOptionType) tcpip.EndpointOption {
+        return self.ep.getOption(opt_type);
+    }
+
+    /// True once the connection has failed (refused, reset, or timed out);
+    /// the next recv/send returns the specific error.
+    pub fn errored(self: *Socket) bool {
+        return self.ep.ready(waiter.EventErr);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -301,7 +315,7 @@ test "socket: TCP clamps segments to the discovered path MTU" {
 
     // As if an ICMP Fragmentation Needed reported a 576-byte path.
     s.updatePMTU(my_ip, 576);
-    try client.ep.setOption(.{ .tcp_nodelay = true });
+    try client.setOption(.{ .tcp_nodelay = true });
 
     var big: [2000]u8 = undefined;
     for (&big, 0..) |*b, idx| b.* = @truncate(idx);
