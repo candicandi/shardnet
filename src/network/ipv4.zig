@@ -303,6 +303,8 @@ pub const IPv4Endpoint = struct {
             ip_header[0] = 0x45;
             const total_len = @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size));
             std.mem.writeInt(u16, ip_header[2..4][0..2], total_len, .big);
+            // PMTUD (RFC 1191) requires DF so routers report instead of fragmenting.
+            if (self.nic.stack.config.ip_pmtud) ip_header[6] |= 0x40;
             ip_header[8] = DEFAULT_TTL;
             ip_header[9] = @as(u8, @intCast(prot));
             @memcpy(ip_header[12..16], &r.local_address.v4);
