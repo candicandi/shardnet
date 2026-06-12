@@ -259,3 +259,78 @@ test "socket: TCP connect/accept/echo over loopback" {
     }
     try std.testing.expectEqualStrings("hello", reply[0..rn]);
 }
+
+test "socket: TCP clamps segments to the discovered path MTU" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var ip4 = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ip4.protocol());
+    const tcp_proto = tcp_mod.TCPProtocol.init(allocator); // freed by s.deinit (vtable)
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var lo = loopback.Loopback.init(allocator);
+    defer lo.deinit();
+    try s.createLoopbackNIC(1, lo.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const my_ip = tcpip.Address{ .v4 = .{ 10, 0, 0, 1 } };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = my_ip, .prefix_len = 24 } });
+    try s.addLinkAddress(my_ip, lo.linkEndpoint().linkAddress());
+
+    var server = try Socket.tcp(&s);
+    defer server.close();
+    try server.bind(addr4(1, 10, 0, 0, 1, 8081));
+    try server.listen(8);
+
+    var client = try Socket.tcp(&s);
+    defer client.close();
+    try client.bind(addr4(1, 10, 0, 0, 1, 0));
+    try client.connect(addr4(1, 10, 0, 0, 1, 8081));
+
+    var conn: ?*Socket = null;
+    var i: usize = 0;
+    while (conn == null and i < 50) : (i += 1) {
+        lo.tick();
+        _ = s.timer_queue.tick();
+        conn = server.accept() catch null;
+    }
+    try std.testing.expect(conn != null);
+    defer conn.?.close();
+
+    // As if an ICMP Fragmentation Needed reported a 576-byte path.
+    s.updatePMTU(my_ip, 576);
+    try client.ep.setOption(.{ .tcp_nodelay = true });
+
+    var big: [2000]u8 = undefined;
+    for (&big, 0..) |*b, idx| b.* = @truncate(idx);
+
+    const delivered_before = lo.stats().loopback_rx;
+
+    var sent: usize = 0;
+    var got: usize = 0;
+    var rbuf: [2048]u8 = undefined;
+    i = 0;
+    while (got < big.len and i < 200) : (i += 1) {
+        if (sent < big.len) {
+            sent += client.send(big[sent..]) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => return err,
+            };
+        }
+        lo.tick();
+        _ = s.timer_queue.tick();
+        got += conn.?.recv(rbuf[got..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+    }
+    try std.testing.expectEqualSlices(u8, &big, rbuf[0..got]);
+
+    // The clamp must be visible on the endpoint (576 - 40 = 536) and on the
+    // wire: 2000 bytes need at least 4 segments at that MSS.
+    const cep: *tcp_mod.TCPEndpoint = @ptrCast(@alignCast(client.ep.ptr));
+    try std.testing.expectEqual(@as(u16, 536), cep.max_segment_size);
+    try std.testing.expect(lo.stats().loopback_rx - delivered_before >= 4);
+}

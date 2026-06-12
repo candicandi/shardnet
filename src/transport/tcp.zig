@@ -651,8 +651,9 @@ pub const TCPEndpoint = struct {
             }
         }
 
-        // Update MSS based on path MTU
-        const mtu = r.nic.linkEP.mtu();
+        // Update MSS from the link MTU clamped to the discovered path MTU
+        var mtu = r.nic.linkEP.mtu();
+        if (self.stack.pmtuFor(ra.addr)) |pmtu| mtu = @min(mtu, pmtu);
         const header_overhead: u16 = if (la.addr == .v4) 40 else 60;
         if (mtu > header_overhead) {
             const mss: u16 = @intCast(mtu - header_overhead);
