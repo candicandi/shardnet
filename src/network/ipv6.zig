@@ -19,6 +19,12 @@ pub const DEFAULT_HOP_LIMIT: u8 = 64;
 /// Maximum time to hold reassembly fragments before expiry (60 seconds per RFC 8200).
 pub const REASSEMBLY_TIMEOUT_MS: i64 = 60_000;
 
+/// Reassembly resource caps (mirrors ipv4.zig): without them a fragment flood
+/// exhausts the heap via unique-id contexts or many fragments per datagram.
+pub const MAX_REASSEMBLY_CONTEXTS: usize = 256;
+pub const MAX_FRAGMENTS_PER_DATAGRAM: usize = 128;
+pub const MAX_REASSEMBLY_BYTES: usize = 65_535;
+
 /// Extension header types (Next Header values).
 pub const NextHeader = struct {
     pub const HOP_BY_HOP: u8 = 0;
@@ -42,17 +48,24 @@ const ReassemblyKey = struct {
 const ReassemblyContext = struct {
     fragments: std.ArrayList(FragmentEntry),
     first_arrival_ms: i64,
-    unfragmentable_part: ?[]u8 = null,
+    /// Running total of buffered payload bytes, for the per-datagram byte cap.
+    total_bytes: usize,
+    /// Next Header from the Fragment header: first header of the fragmentable part.
+    next_header: u8,
 
-    pub fn init(allocator: std.mem.Allocator) ReassemblyContext {
+    pub fn init(allocator: std.mem.Allocator, next_header: u8) ReassemblyContext {
         return .{
             .fragments = std.ArrayList(FragmentEntry).init(allocator),
             .first_arrival_ms = std.time.milliTimestamp(),
+            .total_bytes = 0,
+            .next_header = next_header,
         };
     }
 
     pub fn deinit(self: *ReassemblyContext, allocator: std.mem.Allocator) void {
-        if (self.unfragmentable_part) |u| allocator.free(u);
+        for (self.fragments.items) |f| {
+            allocator.free(f.data);
+        }
         self.fragments.deinit();
     }
 
@@ -64,7 +77,8 @@ const ReassemblyContext = struct {
 
 const FragmentEntry = struct {
     data: []u8,
-    offset: u16,
+    /// Byte offset within the fragmentable part (header field is in 8-byte units).
+    offset: u32,
     more: bool,
 };
 
@@ -116,12 +130,17 @@ pub fn parseExtensionHeaders(data: []const u8, first_next_header: u8) ExtensionH
                     result.valid = false;
                     return result;
                 }
-                next_hdr = data[offset];
                 const frag_off_and_flags = std.mem.readInt(u16, data[offset + 2 ..][0..2], .big);
                 result.fragment_offset = frag_off_and_flags >> 3;
                 result.fragment_more = (frag_off_and_flags & 0x01) != 0;
                 result.fragment_id = std.mem.readInt(u32, data[offset + 4 ..][0..4], .big);
-                offset += 8; // Fragment header is always 8 bytes
+                // Everything after the Fragment header is a slice of the ORIGINAL
+                // packet's fragmentable part — for non-first fragments those bytes
+                // are mid-stream payload, not headers of this packet. Stop here;
+                // reassembly walks the remaining chain on the rebuilt datagram.
+                result.next_header = data[offset];
+                result.payload_offset = offset + 8;
+                return result;
             },
             else => {
                 // Upper layer protocol or unknown
@@ -455,15 +474,375 @@ pub const IPv6Endpoint = struct {
     }
 
     fn handleFragment(self: *IPv6Endpoint, r: *const stack.Route, pkt: tcpip.PacketBuffer, h: header.IPv6, ext_result: ExtensionHeaderResult) void {
-        _ = r;
-        _ = pkt;
-        _ = h;
-        _ = ext_result;
-        // NOTE: IPv6 fragment reassembly would mirror the IPv4 implementation
-        // using the Fragment header's identification field as the key.
-        _ = self;
+        const allocator = self.nic.stack.allocator;
+        self.expireReassemblyContexts();
+
+        const plen: usize = h.payloadLength();
+        const frag_data_off = ext_result.payload_offset;
+        if (plen < frag_data_off) return;
+        const frag_len = plen - frag_data_off;
+        const byte_off = @as(u32, ext_result.fragment_offset.?) * 8;
+        const more = ext_result.fragment_more;
+
+        // RFC 8200 4.5: non-final fragments carry a multiple of 8 bytes, and no
+        // datagram may exceed 65535 reassembled bytes.
+        if (more and frag_len % 8 != 0) {
+            stats.global_stats.ip.reassembly_drops.inc();
+            return;
+        }
+        if (byte_off + frag_len > MAX_REASSEMBLY_BYTES) {
+            stats.global_stats.ip.reassembly_drops.inc();
+            return;
+        }
+
+        const key = ReassemblyKey{
+            .src = h.sourceAddress(),
+            .dst = h.destinationAddress(),
+            .id = ext_result.fragment_id,
+        };
+
+        var ctx_ptr = self.reassembly_list.getPtr(key);
+        if (ctx_ptr == null) {
+            if (self.reassembly_list.count() >= MAX_REASSEMBLY_CONTEXTS) {
+                self.evictOldestReassembly();
+            }
+            const ctx = ReassemblyContext.init(allocator, ext_result.next_header);
+            self.reassembly_list.put(key, ctx) catch return;
+            ctx_ptr = self.reassembly_list.getPtr(key);
+        }
+        const ctx = ctx_ptr.?;
+
+        if (ctx.fragments.items.len >= MAX_FRAGMENTS_PER_DATAGRAM or
+            ctx.total_bytes + frag_len > MAX_REASSEMBLY_BYTES)
+        {
+            self.poisonReassembly(key);
+            return;
+        }
+
+        // RFC 5722: a datagram with ANY overlapping fragments must be silently
+        // discarded in full (overlap is only ever an attack or a broken stack).
+        for (ctx.fragments.items) |f| {
+            if (byte_off < f.offset + f.data.len and f.offset < byte_off + frag_len) {
+                self.poisonReassembly(key);
+                return;
+            }
+        }
+
+        var payload_pkt = pkt;
+        payload_pkt.data.trimFront(header.IPv6MinimumSize + frag_data_off);
+        payload_pkt.data.capLength(frag_len);
+        const bytes = payload_pkt.data.toView(allocator) catch return;
+
+        ctx.fragments.append(.{ .data = bytes, .offset = byte_off, .more = more }) catch {
+            allocator.free(bytes);
+            return;
+        };
+        ctx.total_bytes += frag_len;
+
+        const Sort = struct {
+            fn less(_: void, a: FragmentEntry, b: FragmentEntry) bool {
+                return a.offset < b.offset;
+            }
+        };
+        std.sort.block(FragmentEntry, ctx.fragments.items, {}, Sort.less);
+
+        var expected: u32 = 0;
+        var complete = true;
+        var saw_last = false;
+        for (ctx.fragments.items) |f| {
+            if (saw_last) {
+                // Data past the final fragment can never be valid — poison it.
+                self.poisonReassembly(key);
+                return;
+            }
+            if (f.offset != expected) {
+                complete = false;
+                break;
+            }
+            expected += @intCast(f.data.len);
+            if (!f.more) saw_last = true;
+        }
+
+        if (complete and saw_last) {
+            // Take ownership out of the table first so every exit frees the
+            // fragments exactly once and expiry never sees a half-consumed context.
+            var owned = (self.reassembly_list.fetchRemove(key) orelse return).value;
+            defer owned.deinit(allocator);
+
+            const total_size: usize = expected;
+            if (total_size == 0) return;
+            const reassembled_buf = allocator.alloc(u8, total_size) catch return;
+            defer allocator.free(reassembled_buf);
+            var offset: usize = 0;
+            for (owned.fragments.items) |f| {
+                @memcpy(reassembled_buf[offset .. offset + f.data.len], f.data);
+                offset += f.data.len;
+            }
+
+            // The fragmentable part may itself begin with extension headers
+            // (carried in fragment 0) — walk them to find the transport payload.
+            const chain = parseExtensionHeaders(reassembled_buf, owned.next_header);
+            if (!chain.valid or chain.fragment_offset != null or chain.payload_offset > total_size) {
+                stats.global_stats.ip.reassembly_drops.inc();
+                return;
+            }
+
+            // Receivers shallow-clone (cloneInPool acquires clusters, not bytes),
+            // so the delivered view must be cluster-backed, not this frame's buffer.
+            var wire = buffer.VectorisedView.fromSlice(
+                reassembled_buf[chain.payload_offset..total_size],
+                allocator,
+                &self.nic.stack.cluster_pool,
+            ) catch return;
+            const reassembled_pkt = tcpip.PacketBuffer{
+                .data = wire,
+                .header = buffer.Prependable.init(&[_]u8{}),
+            };
+
+            self.dispatcher.deliverTransportPacket(r, chain.next_header, reassembled_pkt);
+            wire.deinit();
+        }
+    }
+
+    fn poisonReassembly(self: *IPv6Endpoint, key: ReassemblyKey) void {
+        stats.global_stats.ip.reassembly_drops.inc();
+        if (self.reassembly_list.fetchRemove(key)) |kv| {
+            var removed = kv.value;
+            removed.deinit(self.nic.stack.allocator);
+        }
+    }
+
+    fn expireReassemblyContexts(self: *IPv6Endpoint) void {
+        var to_remove = std.ArrayList(ReassemblyKey).init(self.nic.stack.allocator);
+        defer to_remove.deinit();
+
+        var it = self.reassembly_list.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.isExpired()) {
+                to_remove.append(entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.reassembly_list.fetchRemove(key)) |kv| {
+                var removed = kv.value;
+                removed.deinit(self.nic.stack.allocator);
+            }
+            stats.global_stats.ip.reassembly_drops.inc();
+        }
+    }
+
+    // Capacity eviction: drop the longest-waiting reassembly. An attacker
+    // churning ids mostly evicts their own flood; a legitimate datagram
+    // completes in well under the 60s window.
+    fn evictOldestReassembly(self: *IPv6Endpoint) void {
+        var oldest_key: ?ReassemblyKey = null;
+        var oldest_ms: i64 = std.math.maxInt(i64);
+        var it = self.reassembly_list.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.first_arrival_ms < oldest_ms) {
+                oldest_ms = entry.value_ptr.first_arrival_ms;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+        if (oldest_key) |k| {
+            if (self.reassembly_list.fetchRemove(k)) |kv| {
+                var ctx = kv.value;
+                ctx.deinit(self.nic.stack.allocator);
+            }
+            stats.global_stats.ip.reassembly_drops.inc();
+        }
     }
 };
+
+fn buildFragmentPacket(buf: []u8, src: [16]u8, dst: [16]u8, id: u32, nh: u8, off_units: u16, more: bool, chunk: []const u8) usize {
+    const total = header.IPv6MinimumSize + 8 + chunk.len;
+    const h = header.IPv6.init(buf[0..header.IPv6MinimumSize]);
+    h.encode(src, dst, NextHeader.FRAGMENT, @intCast(8 + chunk.len));
+    buf[40] = nh;
+    buf[41] = 0;
+    std.mem.writeInt(u16, buf[42..44], (off_units << 3) | @as(u16, if (more) 1 else 0), .big);
+    std.mem.writeInt(u32, buf[44..48], id, .big);
+    @memcpy(buf[48..][0..chunk.len], chunk);
+    return total;
+}
+
+const ReassemblyTestBed = struct {
+    s: stack.Stack,
+    lo: @import("../drivers/loopback.zig").Loopback,
+    nic: *stack.NIC = undefined,
+    net_ep: stack.NetworkEndpoint = undefined,
+    udp_ep: tcpip.Endpoint = undefined,
+    wq: @import("../waiter.zig").Queue = .{},
+    route: stack.Route = undefined,
+
+    const my_addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1};
+    const peer_addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{2};
+
+    fn init(self: *ReassemblyTestBed, allocator: std.mem.Allocator, ip6: *IPv6Protocol) !void {
+        self.s = try stack.Stack.init(allocator);
+        errdefer self.s.deinit();
+        try self.s.registerNetworkProtocol(ip6.protocol());
+        const udp_proto = @import("../transport/udp.zig").UDPProtocol.init(allocator);
+        try self.s.registerTransportProtocol(udp_proto.protocol());
+
+        self.lo = @import("../drivers/loopback.zig").Loopback.init(allocator);
+        try self.s.createLoopbackNIC(1, self.lo.linkEndpoint());
+        self.nic = self.s.nics.get(1).?;
+        try self.nic.addAddress(.{ .protocol = 0x86dd, .address_with_prefix = .{ .address = .{ .v6 = my_addr }, .prefix_len = 64 } });
+        self.net_ep = self.nic.network_endpoints.get(0x86dd).?;
+
+        self.udp_ep = try udp_proto.protocol().newEndpoint(&self.s, 0x86dd, &self.wq);
+        try self.udp_ep.bind(.{ .nic = 1, .addr = .{ .v6 = my_addr }, .port = 9000 });
+
+        self.route = stack.Route{
+            .local_address = .{ .v6 = my_addr },
+            .remote_address = .{ .v6 = peer_addr },
+            .local_link_address = self.lo.linkEndpoint().linkAddress(),
+            .net_proto = 0x86dd,
+            .nic = self.nic,
+        };
+    }
+
+    fn deinit(self: *ReassemblyTestBed) void {
+        self.udp_ep.close();
+        self.s.deinit();
+        self.lo.deinit();
+    }
+
+    fn feed(self: *ReassemblyTestBed, bytes: []const u8) void {
+        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(bytes) }};
+        const pkt = tcpip.PacketBuffer{
+            .data = buffer.VectorisedView.init(bytes.len, &views),
+            .header = buffer.Prependable.init(&[_]u8{}),
+        };
+        self.net_ep.handlePacket(&self.route, pkt);
+    }
+
+    fn recv(self: *ReassemblyTestBed, out: []u8, from: ?*tcpip.FullAddress) tcpip.Error!usize {
+        var iov = [_][]u8{out};
+        var uio = buffer.Uio.init(&iov);
+        return self.udp_ep.readv(&uio, from);
+    }
+};
+
+test "IPv6 fragment reassembly delivers a UDP datagram (out-of-order arrival)" {
+    const allocator = std.testing.allocator;
+    var ip6 = IPv6Protocol.init();
+    var tb: ReassemblyTestBed = undefined;
+    tb.wq = .{};
+    try tb.init(allocator, &ip6);
+    defer tb.deinit();
+
+    // Original datagram: UDP header (8) + 24 payload bytes = 32 fragmentable bytes.
+    var dgram: [32]u8 = undefined;
+    std.mem.writeInt(u16, dgram[0..2], 9001, .big);
+    std.mem.writeInt(u16, dgram[2..4], 9000, .big);
+    std.mem.writeInt(u16, dgram[4..6], 32, .big);
+    std.mem.writeInt(u16, dgram[6..8], 0, .big);
+    for (dgram[8..], 0..) |*b, idx| b.* = @truncate(idx);
+
+    var f1: [128]u8 = undefined;
+    var f2: [128]u8 = undefined;
+    const n1 = buildFragmentPacket(&f1, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x1234, NextHeader.UDP, 0, true, dgram[0..16]);
+    const n2 = buildFragmentPacket(&f2, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x1234, NextHeader.UDP, 2, false, dgram[16..32]);
+
+    // Deliver the tail first to prove offset sorting.
+    tb.feed(f2[0..n2]);
+    var rbuf: [64]u8 = undefined;
+    try std.testing.expectError(tcpip.Error.WouldBlock, tb.recv(&rbuf, null));
+
+    tb.feed(f1[0..n1]);
+    var from: tcpip.FullAddress = undefined;
+    const n = try tb.recv(&rbuf, &from);
+    try std.testing.expectEqualSlices(u8, dgram[8..], rbuf[0..n]);
+    try std.testing.expectEqual(@as(u16, 9001), from.port);
+
+    // RFC 6946 atomic fragment (offset 0, M=0) delivers immediately.
+    var fa: [128]u8 = undefined;
+    const na = buildFragmentPacket(&fa, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x9999, NextHeader.UDP, 0, false, &dgram);
+    tb.feed(fa[0..na]);
+    const n_atomic = try tb.recv(&rbuf, null);
+    try std.testing.expectEqualSlices(u8, dgram[8..], rbuf[0..n_atomic]);
+}
+
+test "IPv6 reassembly drops the whole datagram on overlap (RFC 5722)" {
+    const allocator = std.testing.allocator;
+    var ip6 = IPv6Protocol.init();
+    var tb: ReassemblyTestBed = undefined;
+    tb.wq = .{};
+    try tb.init(allocator, &ip6);
+    defer tb.deinit();
+
+    const drops_before = stats.global_stats.ip.reassembly_drops.load();
+
+    var chunk16 = [_]u8{0xab} ** 16;
+    var f1: [128]u8 = undefined;
+    var f2: [128]u8 = undefined;
+    var f3: [128]u8 = undefined;
+    const n1 = buildFragmentPacket(&f1, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x42, NextHeader.UDP, 0, true, &chunk16);
+    // Overlaps bytes 8..16 of the first fragment.
+    const n2 = buildFragmentPacket(&f2, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x42, NextHeader.UDP, 1, false, &chunk16);
+    // Would have completed the datagram had the context survived.
+    const n3 = buildFragmentPacket(&f3, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x42, NextHeader.UDP, 2, false, &chunk16);
+
+    tb.feed(f1[0..n1]);
+    tb.feed(f2[0..n2]);
+    tb.feed(f3[0..n3]);
+
+    var rbuf: [64]u8 = undefined;
+    try std.testing.expectError(tcpip.Error.WouldBlock, tb.recv(&rbuf, null));
+    try std.testing.expect(stats.global_stats.ip.reassembly_drops.load() > drops_before);
+}
+
+test "IPv6 reassembly drops non-final fragments not multiple of 8" {
+    const allocator = std.testing.allocator;
+    var ip6 = IPv6Protocol.init();
+    var tb: ReassemblyTestBed = undefined;
+    tb.wq = .{};
+    try tb.init(allocator, &ip6);
+    defer tb.deinit();
+
+    const drops_before = stats.global_stats.ip.reassembly_drops.load();
+
+    var chunk12 = [_]u8{0xcd} ** 12;
+    var f1: [128]u8 = undefined;
+    const n1 = buildFragmentPacket(&f1, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x77, NextHeader.UDP, 0, true, &chunk12);
+    tb.feed(f1[0..n1]);
+
+    const ip6_ep: *IPv6Endpoint = @ptrCast(@alignCast(tb.net_ep.ptr));
+    try std.testing.expectEqual(@as(usize, 0), ip6_ep.reassembly_list.count());
+    try std.testing.expect(stats.global_stats.ip.reassembly_drops.load() > drops_before);
+}
+
+test "IPv6 reassembly poisons a datagram with data past the final fragment" {
+    const allocator = std.testing.allocator;
+    var ip6 = IPv6Protocol.init();
+    var tb: ReassemblyTestBed = undefined;
+    tb.wq = .{};
+    try tb.init(allocator, &ip6);
+    defer tb.deinit();
+
+    const drops_before = stats.global_stats.ip.reassembly_drops.load();
+
+    var chunk8 = [_]u8{0xef} ** 8;
+    var f1: [128]u8 = undefined;
+    var f2: [128]u8 = undefined;
+    var f3: [128]u8 = undefined;
+    const n1 = buildFragmentPacket(&f1, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x55, NextHeader.UDP, 0, true, &chunk8);
+    // Beyond the final fragment's end (offset 32, final ends at 16).
+    const n3 = buildFragmentPacket(&f3, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x55, NextHeader.UDP, 4, false, &chunk8);
+    // Final fragment: bytes 8..16.
+    const n2 = buildFragmentPacket(&f2, ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, 0x55, NextHeader.UDP, 1, false, &chunk8);
+
+    tb.feed(f1[0..n1]);
+    tb.feed(f3[0..n3]);
+    tb.feed(f2[0..n2]);
+
+    var rbuf: [64]u8 = undefined;
+    try std.testing.expectError(tcpip.Error.WouldBlock, tb.recv(&rbuf, null));
+    try std.testing.expect(stats.global_stats.ip.reassembly_drops.load() > drops_before);
+}
 
 test "IPv6 extension header parsing" {
     // Test simple case - no extension headers
