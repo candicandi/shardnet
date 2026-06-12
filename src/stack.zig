@@ -25,6 +25,19 @@ pub const CapabilityResolutionRequired: LinkEndpointCapabilities = 1 << 1;
 /// Upper bound on the link-address (ARP/NDP) cache to resist spoofed-reply floods.
 pub const MAX_LINK_ADDR_CACHE: usize = 4096;
 
+/// Upper bound on the PMTU cache; ICMP errors are off-path forgeable, so the
+/// per-destination state they create must be bounded.
+pub const MAX_PMTU_CACHE: usize = 4096;
+
+/// RFC 1191 section 6.3: age PMTU entries out after ~10 minutes so the path
+/// gets re-probed at larger sizes.
+pub const PMTU_TTL_MS: i64 = 10 * 60 * 1000;
+
+pub const PMTUEntry = struct {
+    mtu: u32,
+    updated_ms: i64,
+};
+
 /// Stack configuration.
 pub const Config = struct {
     /// Maximum Segment Lifetime for TCP (milliseconds).
@@ -47,6 +60,9 @@ pub const Config = struct {
     arp_pending_timeout_ms: i64 = 1000,
     /// Cluster pool prewarm count.
     cluster_pool_prewarm: usize = 1024,
+    /// Path MTU discovery: set DF on IPv4 egress and honor ICMP
+    /// Fragmentation Needed / Packet Too Big (RFC 1191 / RFC 8201).
+    ip_pmtud: bool = true,
     /// Unix socket path for health check endpoint (null to disable).
     /// // NOTE: Unix socket provides health monitoring without HTTP dependency.
     health_check_socket: ?[]const u8 = "/tmp/shardnet.sock",
@@ -611,6 +627,7 @@ pub const Stack = struct {
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
     endpoints: TransportTable,
     link_addr_cache: std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80),
+    pmtu_cache: std.HashMap(tcpip.Address, PMTUEntry, AddressContext, 80),
     transport_protocols: std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol),
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
@@ -644,6 +661,7 @@ pub const Stack = struct {
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
             .endpoints = TransportTable.init(allocator),
             .link_addr_cache = std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80).init(allocator),
+            .pmtu_cache = std.HashMap(tcpip.Address, PMTUEntry, AddressContext, 80).init(allocator),
             .transport_protocols = std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol).init(allocator),
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
@@ -681,6 +699,7 @@ pub const Stack = struct {
         }
         self.nics.deinit();
         self.link_addr_cache.deinit();
+        self.pmtu_cache.deinit();
 
         var transport_it = self.transport_protocols.valueIterator();
         while (transport_it.next()) |proto| {
@@ -814,6 +833,47 @@ pub const Stack = struct {
                 }
             }
         }
+    }
+
+    pub fn hasLocalAddress(self: *Stack, addr: tcpip.Address) bool {
+        var it = self.nics.valueIterator();
+        while (it.next()) |nic| {
+            if (nic.*.hasAddress(addr)) return true;
+        }
+        return false;
+    }
+
+    pub fn updatePMTU(self: *Stack, dest: tcpip.Address, new_mtu: u32) void {
+        if (!self.config.ip_pmtud) return;
+        const now = std.time.milliTimestamp();
+        if (self.pmtu_cache.getPtr(dest)) |entry| {
+            // A fresh entry only ever shrinks; growth happens by aging out
+            // and re-probing (RFC 1191 section 6.3).
+            if (now - entry.updated_ms <= PMTU_TTL_MS and new_mtu >= entry.mtu) return;
+            entry.* = .{ .mtu = new_mtu, .updated_ms = now };
+            stats.global_stats.ip.pmtu_updates.inc();
+            return;
+        }
+        // Entries carry their own freshness, so an arbitrary victim is fine:
+        // a still-active path is re-learned by the next ICMP error.
+        if (self.pmtu_cache.count() >= MAX_PMTU_CACHE) {
+            var it = self.pmtu_cache.keyIterator();
+            if (it.next()) |victim| {
+                const victim_key = victim.*;
+                _ = self.pmtu_cache.remove(victim_key);
+            }
+        }
+        self.pmtu_cache.put(dest, .{ .mtu = new_mtu, .updated_ms = now }) catch return;
+        stats.global_stats.ip.pmtu_updates.inc();
+    }
+
+    pub fn pmtuFor(self: *Stack, dest: tcpip.Address) ?u32 {
+        const entry = self.pmtu_cache.get(dest) orelse return null;
+        if (std.time.milliTimestamp() - entry.updated_ms > PMTU_TTL_MS) {
+            _ = self.pmtu_cache.remove(dest);
+            return null;
+        }
+        return entry.mtu;
     }
 
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {
@@ -1034,6 +1094,49 @@ test "Stack.init with config" {
 
     try std.testing.expectEqual(@as(u64, 60000), s.tcp_msl);
     try std.testing.expectEqual(@as(u16, 49152), s.ephemeral_port);
+}
+
+test "Stack PMTU cache: shrink-only while fresh, aging, bounded" {
+    const allocator = std.testing.allocator;
+    var s = try Stack.init(allocator);
+    defer s.deinit();
+
+    const dst = tcpip.Address{ .v4 = .{ 192, 0, 2, 1 } };
+    try std.testing.expectEqual(@as(?u32, null), s.pmtuFor(dst));
+
+    s.updatePMTU(dst, 1400);
+    try std.testing.expectEqual(@as(?u32, 1400), s.pmtuFor(dst));
+
+    // A fresh entry must not grow from a (possibly forged) ICMP error.
+    s.updatePMTU(dst, 1500);
+    try std.testing.expectEqual(@as(?u32, 1400), s.pmtuFor(dst));
+
+    s.updatePMTU(dst, 1000);
+    try std.testing.expectEqual(@as(?u32, 1000), s.pmtuFor(dst));
+
+    // An aged entry is dropped on lookup so the path re-probes larger MTUs.
+    s.pmtu_cache.getPtr(dst).?.updated_ms -= PMTU_TTL_MS + 1;
+    try std.testing.expectEqual(@as(?u32, null), s.pmtuFor(dst));
+    try std.testing.expectEqual(@as(usize, 0), s.pmtu_cache.count());
+
+    // The cache never exceeds its bound.
+    var i: u32 = 0;
+    while (i < MAX_PMTU_CACHE + 10) : (i += 1) {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, i, .big);
+        s.updatePMTU(.{ .v4 = bytes }, 1280);
+    }
+    try std.testing.expectEqual(MAX_PMTU_CACHE, s.pmtu_cache.count());
+}
+
+test "Stack PMTU cache: disabled by config" {
+    const allocator = std.testing.allocator;
+    var s = try Stack.initWithConfig(allocator, .{ .ip_pmtud = false });
+    defer s.deinit();
+
+    const dst = tcpip.Address{ .v4 = .{ 192, 0, 2, 1 } };
+    s.updatePMTU(dst, 1400);
+    try std.testing.expectEqual(@as(?u32, null), s.pmtuFor(dst));
 }
 
 test "Stack graceful shutdown" {
