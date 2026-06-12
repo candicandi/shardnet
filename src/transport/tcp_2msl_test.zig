@@ -257,6 +257,141 @@ test "TCP TIME_WAIT reuse with new SYN" {
     try std.testing.expect(!ep_client.time_wait_timer.active);
 }
 
+test "TCP TIME_WAIT ignores old duplicate SYN" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_link = NullLinkEndpoint{};
+    const link_ep = fake_link.linkEndpoint();
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+
+    const client_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const server_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+
+    var wq_client = waiter.Queue{};
+    const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
+    const ep_client: *TCPEndpoint = @ptrCast(@alignCast(ep_client_res.ptr));
+    defer ep_client.close();
+
+    ep_client.state = .time_wait;
+    ep_client.local_addr = client_addr;
+    ep_client.remote_addr = server_addr;
+    ep_client.rcv_nxt = 5000;
+    const id = stack.TransportEndpointID{
+        .local_port = client_addr.port,
+        .local_address = client_addr.addr,
+        .remote_port = server_addr.port,
+        .remote_address = server_addr.addr,
+    };
+    try s.registerTransportEndpoint(id, ep_client.transportEndpoint());
+    s.timer_queue.schedule(&ep_client.time_wait_timer, 60000);
+
+    // Old duplicate SYN: sequence below the last one received (RFC 1122 4.2.2.13)
+    const syn_buf = try allocator.alloc(u8, header.TCPMinimumSize);
+    defer allocator.free(syn_buf);
+    @memset(syn_buf, 0);
+    var syn = header.TCP.init(syn_buf);
+    syn.encode(server_addr.port, client_addr.port, 4000, 0, header.TCPFlagSyn, 65535);
+
+    const r_to_client = stack.Route{
+        .local_address = client_addr.addr,
+        .remote_address = server_addr.addr,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+    var syn_pkt = tcpip.PacketBuffer{
+        .data = try buffer.VectorisedView.fromSlice(syn_buf, allocator, &s.cluster_pool),
+        .header = buffer.Prependable.init(&[_]u8{}),
+    };
+    defer syn_pkt.data.deinit();
+
+    ep_client.handlePacket(&r_to_client, id, syn_pkt);
+
+    // The old SYN must not assassinate TIME_WAIT
+    try std.testing.expectEqual(EndpointState.time_wait, ep_client.state);
+    try std.testing.expect(ep_client.time_wait_timer.active);
+}
+
+test "TCP TIME_WAIT re-ACKs retransmitted FIN and restarts 2MSL" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    s.tcp_msl = 100; // 2MSL = 200ms
+
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_link = NullLinkEndpoint{};
+    const link_ep = fake_link.linkEndpoint();
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+
+    const client_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const server_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+
+    var wq_client = waiter.Queue{};
+    const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
+    const ep_client: *TCPEndpoint = @ptrCast(@alignCast(ep_client_res.ptr));
+    defer ep_client.close();
+
+    ep_client.state = .time_wait;
+    ep_client.local_addr = client_addr;
+    ep_client.remote_addr = server_addr;
+    ep_client.rcv_nxt = 5001;
+    const id = stack.TransportEndpointID{
+        .local_port = client_addr.port,
+        .local_address = client_addr.addr,
+        .remote_port = server_addr.port,
+        .remote_address = server_addr.addr,
+    };
+    try s.registerTransportEndpoint(id, ep_client.transportEndpoint());
+    // Timer about to fire: a retransmitted FIN must push it back to a full 2MSL.
+    s.timer_queue.schedule(&ep_client.time_wait_timer, 50);
+
+    const fin_buf = try allocator.alloc(u8, header.TCPMinimumSize);
+    defer allocator.free(fin_buf);
+    @memset(fin_buf, 0);
+    var fin = header.TCP.init(fin_buf);
+    fin.encode(server_addr.port, client_addr.port, 5000, ep_client.snd_nxt, header.TCPFlagFin | header.TCPFlagAck, 65535);
+
+    const r_to_client = stack.Route{
+        .local_address = client_addr.addr,
+        .remote_address = server_addr.addr,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+    var fin_pkt = tcpip.PacketBuffer{
+        .data = try buffer.VectorisedView.fromSlice(fin_buf, allocator, &s.cluster_pool),
+        .header = buffer.Prependable.init(&[_]u8{}),
+    };
+    defer fin_pkt.data.deinit();
+
+    ep_client.handlePacket(&r_to_client, id, fin_pkt);
+
+    try std.testing.expectEqual(EndpointState.time_wait, ep_client.state);
+    try std.testing.expect(ep_client.time_wait_timer.active);
+
+    // Past the original 50ms deadline: a non-restarted timer would have fired.
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 60);
+    try std.testing.expectEqual(EndpointState.time_wait, ep_client.state);
+
+    // Past the restarted 2MSL: now it must close.
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 201);
+    try std.testing.expectEqual(EndpointState.closed, ep_client.state);
+}
+
 test "TCP parameterized MSL value" {
     const allocator = std.testing.allocator;
     var s = try stack.Stack.init(allocator);

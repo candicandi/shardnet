@@ -1695,8 +1695,11 @@ pub const TCPEndpoint = struct {
                 // RFC 1337: Ignore RST in TIME_WAIT to prevent TIME_WAIT assassination
                 return;
             }
-            if (fl & header.TCPFlagSyn != 0 and fl & header.TCPFlagAck == 0) {
-                // Allow new connection on same 4-tuple if SYN has higher seq
+            // RFC 1122 4.2.2.13: only a SYN above the old incarnation's window
+            // may reuse the 4-tuple; an old duplicate SYN must not end TIME_WAIT.
+            if (fl & header.TCPFlagSyn != 0 and fl & header.TCPFlagAck == 0 and
+                seqAfter(h.sequenceNumber(), self.rcv_nxt))
+            {
                 self.state = .closed;
                 self.stack.timer_queue.cancel(&self.time_wait_timer);
                 if (self.local_addr) |la| {
@@ -2068,6 +2071,15 @@ pub const TCPEndpoint = struct {
                     }
                     self.decStackRef();
                     notify_mask |= waiter.EventHUp;
+                }
+            },
+            .time_wait => {
+                // RFC 793: our final ACK was lost — re-ACK the retransmitted
+                // FIN and restart the 2MSL timer.
+                if (fl & header.TCPFlagFin != 0) {
+                    self.sendControl(header.TCPFlagAck) catch {};
+                    self.stack.timer_queue.cancel(&self.time_wait_timer);
+                    self.stack.timer_queue.schedule(&self.time_wait_timer, 2 * self.stack.tcp_msl);
                 }
             },
             .closed => {
