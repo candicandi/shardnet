@@ -312,6 +312,8 @@ pub const TCPEndpoint = struct {
     app_closed: bool = false,
     owns_waiter_queue: bool = false,
     stack_ref: bool = false,
+    // Why the connection entered error_state, surfaced by read/write paths.
+    pending_error: ?tcpip.Error = null,
 
     // Queues
     accepted_queue: std.DoublyLinkedList(tcpip.AcceptReturn) = .{},
@@ -492,6 +494,7 @@ pub const TCPEndpoint = struct {
         self.snd_wnd = 65535;
         self.ref_count = 1;
         self.stack_ref = false;
+        self.pending_error = null;
         self.cached_route = null;
         self.app_closed = false;
         self.owns_waiter_queue = false;
@@ -636,6 +639,7 @@ pub const TCPEndpoint = struct {
     /// Write data to the connection, applying Nagle algorithm if enabled.
     /// RFC 896: Buffer small segments until we have MSS or receive ACK.
     fn writeInternal(self: *TCPEndpoint, view: buffer.VectorisedView) tcpip.Error!usize {
+        if (self.state == .error_state) return self.pending_error orelse tcpip.Error.InvalidEndpointState;
         if (self.state != .established and self.state != .close_wait) return tcpip.Error.InvalidEndpointState;
         const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
         const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
@@ -856,6 +860,7 @@ pub const TCPEndpoint = struct {
             // NOTE: Connection is dead, close it
             log.warn("TCP: Keepalive probes exhausted, closing connection", .{});
             self.state = .error_state;
+            self.pending_error = tcpip.Error.ConnectionTimedOut;
             self.notify(waiter.EventErr | waiter.EventHUp);
             return;
         }
@@ -1114,6 +1119,7 @@ pub const TCPEndpoint = struct {
                 // Give up after too many retransmits
                 if (self.retransmit_count > 30) {
                     self.state = .error_state;
+                    self.pending_error = tcpip.Error.ConnectionTimedOut;
                     while (self.snd_queue.popFirst()) |node| {
                         node.data.data.deinit();
                         self.proto.segment_node_pool.release(node);
@@ -1375,6 +1381,9 @@ pub const TCPEndpoint = struct {
     }
 
     fn readv(self: *TCPEndpoint, uio: *buffer.Uio, addr: ?*tcpip.FullAddress) tcpip.Error!usize {
+        if (self.rcv_list.first == null and self.state == .error_state) {
+            return self.pending_error orelse tcpip.Error.InvalidEndpointState;
+        }
         if (self.rcv_list.first == null) return if (self.state == .closed or self.state == .close_wait) 0 else tcpip.Error.WouldBlock;
         if (addr) |a| a.* = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
 
@@ -1415,6 +1424,9 @@ pub const TCPEndpoint = struct {
     fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.VectorisedView {
         const self: *TCPEndpoint = @ptrCast(@alignCast(ptr));
 
+        if (self.rcv_list.first == null and self.state == .error_state) {
+            return self.pending_error orelse tcpip.Error.InvalidEndpointState;
+        }
         if (self.rcv_list.first == null) return if (self.state == .closed or self.state == .close_wait or self.state == .time_wait or self.state == .last_ack) buffer.VectorisedView.empty() else tcpip.Error.WouldBlock;
 
         if (addr) |a| a.* = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
@@ -1559,6 +1571,29 @@ pub const TCPEndpoint = struct {
         self.snd_queue.append(node);
         if (flags & (header.TCPFlagSyn | header.TCPFlagFin) != 0) self.snd_nxt +%= 1;
         try self.flushSendQueue();
+    }
+
+    // Hard-terminate the connection: no further exchange is possible, so the
+    // state machine's refs (table + stack) are dropped here; the app's ref is
+    // released by its own close().
+    fn terminateWithError(self: *TCPEndpoint, err: tcpip.Error, notify_mask: *waiter.EventMask) void {
+        self.state = .error_state;
+        self.pending_error = err;
+        self.stack.timer_queue.cancel(&self.retransmit_timer);
+        self.stack.timer_queue.cancel(&self.delayed_ack_timer);
+        self.stack.timer_queue.cancel(&self.keepalive_timer);
+        if (self.local_addr) |la| {
+            if (self.remote_addr) |ra| {
+                self.stack.unregisterTransportEndpoint(.{
+                    .local_port = la.port,
+                    .local_address = la.addr,
+                    .remote_port = ra.port,
+                    .remote_address = ra.addr,
+                });
+            }
+        }
+        self.decStackRef();
+        notify_mask.* |= waiter.EventErr | waiter.EventHUp;
     }
 
     fn sendControl(self: *TCPEndpoint, flags: u8) !void {
@@ -1724,6 +1759,32 @@ pub const TCPEndpoint = struct {
                 self.decStackRef();
                 return;
             }
+        }
+
+        if (fl & header.TCPFlagRst != 0) {
+            stats.global_stats.tcp.resets_received.inc();
+            switch (self.state) {
+                // RFC 793 3.4: in SYN_SENT a RST is valid only with an ACK
+                // that acknowledges our SYN.
+                .syn_sent => {
+                    if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) {
+                        self.terminateWithError(tcpip.Error.ConnectionRefused, &notify_mask);
+                    }
+                },
+                // RFC 5961 3.2: only an exact rcv_nxt match resets; an
+                // in-window sequence gets a challenge ACK (blind-reset
+                // mitigation); anything else is dropped.
+                .established, .fin_wait1, .fin_wait2, .close_wait, .closing, .last_ack => {
+                    const seq = h.sequenceNumber();
+                    if (seq == self.rcv_nxt) {
+                        self.terminateWithError(tcpip.Error.ConnectionReset, &notify_mask);
+                    } else if (seqAfter(seq, self.rcv_nxt) and seqBefore(seq, self.rcv_nxt +% self.rcv_wnd)) {
+                        self.sendControl(header.TCPFlagAck) catch {};
+                    }
+                },
+                else => {},
+            }
+            return;
         }
 
         const now = std.time.milliTimestamp();

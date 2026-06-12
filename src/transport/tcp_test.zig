@@ -478,3 +478,165 @@ test "TCP window scaling negotiation" {
     try std.testing.expectEqual(@as(u8, 14), ep.rcv_wnd_scale);
     try std.testing.expectEqual(@as(u32, 64 * 1024 * 1024), ep.rcv_wnd_max);
 }
+
+test "TCP RST in SYN_SENT refuses the connection" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_ep = MockLinkEndpoint{ .allocator = allocator };
+    defer fake_ep.deinit();
+    try s.createNIC(1, fake_ep.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const client_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const server_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 81 };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = client_addr.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(server_addr.addr, .{ .addr = [_]u8{0} ** 6 });
+    try s.addLinkAddress(client_addr.addr, .{ .addr = [_]u8{0} ** 6 });
+
+    var wq_client = waiter.Queue{};
+    const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
+    const ep_client: *TCPEndpoint = @ptrCast(@alignCast(ep_client_res.ptr));
+    defer ep_client.close();
+    try ep_client.endpoint().bind(client_addr);
+    try ep_client.endpoint().connect(server_addr);
+    try std.testing.expectEqual(tcp.EndpointState.syn_sent, ep_client.state);
+
+    const resets_before = shardnet.stats.global_stats.tcp.resets_received.load();
+
+    // Peer refuses: RST|ACK acknowledging our SYN
+    const rst_buf = try allocator.alloc(u8, header.TCPMinimumSize);
+    defer allocator.free(rst_buf);
+    @memset(rst_buf, 0);
+    var rst = header.TCP.init(rst_buf);
+    rst.encode(server_addr.port, client_addr.port, 0, ep_client.snd_nxt, header.TCPFlagRst | header.TCPFlagAck, 0);
+
+    const r_to_client = stack.Route{
+        .local_address = client_addr.addr,
+        .remote_address = server_addr.addr,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+    const id_to_client = stack.TransportEndpointID{
+        .local_port = client_addr.port,
+        .local_address = client_addr.addr,
+        .remote_port = server_addr.port,
+        .remote_address = server_addr.addr,
+    };
+    var rst_pkt = tcpip.PacketBuffer{
+        .data = try buffer.VectorisedView.fromSlice(rst_buf, allocator, &s.cluster_pool),
+        .header = buffer.Prependable.init(&[_]u8{}),
+    };
+    defer rst_pkt.data.deinit();
+    ep_client.handlePacket(&r_to_client, id_to_client, rst_pkt);
+
+    try std.testing.expectEqual(tcp.EndpointState.error_state, ep_client.state);
+    try std.testing.expect(wq_client.events() & waiter.EventErr != 0);
+    try std.testing.expectEqual(resets_before + 1, shardnet.stats.global_stats.tcp.resets_received.load());
+    // The 4-tuple is released
+    try std.testing.expect(s.endpoints.get(id_to_client) == null);
+
+    // The error is surfaced to readers
+    var rbuf: [16]u8 = undefined;
+    var iov = [_][]u8{&rbuf};
+    var uio = buffer.Uio.init(&iov);
+    try std.testing.expectError(tcpip.Error.ConnectionRefused, ep_client.endpoint().readv(&uio, null));
+}
+
+test "TCP RST handling in ESTABLISHED follows RFC 5961" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_ep = MockLinkEndpoint{ .allocator = allocator };
+    defer fake_ep.deinit();
+    try s.createNIC(1, fake_ep.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const local_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const remote_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = local_addr.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(remote_addr.addr, .{ .addr = [_]u8{0} ** 6 });
+
+    var wq = waiter.Queue{};
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep: *TCPEndpoint = @ptrCast(@alignCast(ep_res.ptr));
+    defer ep.close();
+    ep.state = .established;
+    ep.local_addr = local_addr;
+    ep.remote_addr = remote_addr;
+    ep.rcv_nxt = 5000;
+    const id = stack.TransportEndpointID{
+        .local_port = local_addr.port,
+        .local_address = local_addr.addr,
+        .remote_port = remote_addr.port,
+        .remote_address = remote_addr.addr,
+    };
+    try s.registerTransportEndpoint(id, ep.transportEndpoint());
+
+    const r = stack.Route{
+        .local_address = local_addr.addr,
+        .remote_address = remote_addr.addr,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+
+    const feedRst = struct {
+        fn run(st: *stack.Stack, endpoint: *TCPEndpoint, route: *const stack.Route, eid: stack.TransportEndpointID, alloc: std.mem.Allocator, seq: u32) !void {
+            const rst_buf = try alloc.alloc(u8, header.TCPMinimumSize);
+            defer alloc.free(rst_buf);
+            @memset(rst_buf, 0);
+            var rst = header.TCP.init(rst_buf);
+            rst.encode(eid.remote_port, eid.local_port, seq, 0, header.TCPFlagRst, 0);
+            var pkt = tcpip.PacketBuffer{
+                .data = try buffer.VectorisedView.fromSlice(rst_buf, alloc, &st.cluster_pool),
+                .header = buffer.Prependable.init(&[_]u8{}),
+            };
+            defer pkt.data.deinit();
+            endpoint.handlePacket(route, eid, pkt);
+        }
+    }.run;
+
+    // Out-of-window RST: dropped, no reply, no state change.
+    if (fake_ep.last_pkt) |p| {
+        allocator.free(p);
+        fake_ep.last_pkt = null;
+    }
+    try feedRst(&s, ep, &r, id, allocator, 5000 -% 1000);
+    try std.testing.expectEqual(tcp.EndpointState.established, ep.state);
+    try std.testing.expect(fake_ep.last_pkt == null);
+
+    // In-window but inexact: challenge ACK, still established.
+    try feedRst(&s, ep, &r, id, allocator, 6000);
+    try std.testing.expectEqual(tcp.EndpointState.established, ep.state);
+    try std.testing.expect(fake_ep.last_pkt != null);
+    const challenge = header.TCP.init(fake_ep.last_pkt.?[20..]);
+    try std.testing.expectEqual(header.TCPFlagAck, challenge.flags());
+
+    // Exact rcv_nxt match: connection reset.
+    try feedRst(&s, ep, &r, id, allocator, 5000);
+    try std.testing.expectEqual(tcp.EndpointState.error_state, ep.state);
+    try std.testing.expect(wq.events() & waiter.EventErr != 0);
+    try std.testing.expect(s.endpoints.get(id) == null);
+
+    // Reads and writes surface the reset.
+    var rbuf: [16]u8 = undefined;
+    var iov = [_][]u8{&rbuf};
+    var uio = buffer.Uio.init(&iov);
+    try std.testing.expectError(tcpip.Error.ConnectionReset, ep.endpoint().readv(&uio, null));
+    var wbuf = [_]u8{0xab} ** 8;
+    var wiov = [_][]u8{&wbuf};
+    var wuio = buffer.Uio.init(&wiov);
+    try std.testing.expectError(tcpip.Error.ConnectionReset, ep.endpoint().writev(&wuio, .{}));
+}

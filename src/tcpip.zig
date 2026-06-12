@@ -119,6 +119,9 @@ pub const Error = error{
     NotSupported,
     AddressInUse,
     ArpPending,
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionTimedOut,
 };
 
 /// Flow hash for RSS-style receive steering.
