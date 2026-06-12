@@ -28,6 +28,9 @@ pub const Socket = struct {
     ep: tcpip.Endpoint,
     wq: *waiter.Queue,
     allocator: std.mem.Allocator,
+    // Accepted sockets get a pool-backed queue owned by the endpoint (released
+    // on endpoint destroy), so only sockets we created may destroy their wq.
+    owns_wq: bool,
 
     fn create(s: *stack.Stack, trans: tcpip.TransportProtocolNumber, net: tcpip.NetworkProtocolNumber) !*Socket {
         const proto = s.transport_protocols.get(trans) orelse return Error.NotPermitted;
@@ -36,7 +39,7 @@ pub const Socket = struct {
         wq.* = .{};
         const ep = try proto.newEndpoint(s, net, wq);
         const self = try s.allocator.create(Socket);
-        self.* = .{ .stack = s, .ep = ep, .wq = wq, .allocator = s.allocator };
+        self.* = .{ .stack = s, .ep = ep, .wq = wq, .allocator = s.allocator, .owns_wq = true };
         return self;
     }
 
@@ -59,7 +62,7 @@ pub const Socket = struct {
 
     pub fn close(self: *Socket) void {
         self.ep.close();
-        self.allocator.destroy(self.wq);
+        if (self.owns_wq) self.allocator.destroy(self.wq);
         self.allocator.destroy(self);
     }
 
@@ -81,7 +84,7 @@ pub const Socket = struct {
             res.ep.close();
             return Error.OutOfMemory;
         };
-        child.* = .{ .stack = self.stack, .ep = res.ep, .wq = res.wq, .allocator = self.allocator };
+        child.* = .{ .stack = self.stack, .ep = res.ep, .wq = res.wq, .allocator = self.allocator, .owns_wq = false };
         return child;
     }
 
@@ -136,6 +139,7 @@ pub const Socket = struct {
 
 const ipv4 = @import("network/ipv4.zig");
 const udp_mod = @import("transport/udp.zig");
+const tcp_mod = @import("transport/tcp.zig");
 const loopback = @import("drivers/loopback.zig");
 
 fn addr4(nic: tcpip.NICID, a: u8, b: u8, c: u8, d: u8, port: u16) tcpip.FullAddress {
@@ -182,8 +186,76 @@ test "socket: UDP datagram round-trip over loopback" {
     try std.testing.expectEqual(@as(u16, 9001), from.port);
 }
 
-// TODO: TCP connect/accept/echo over loopback. The wrapper, the loopback
-// delivery, and the UDP path all work; packets flow during a TCP handshake but
-// it does not yet complete to an acceptable connection over the real delivery
-// path (SYN-cookie child creation / same-host 4-tuple / accept-queue wiring need
-// a focused pass). Tracked as the next step for the socket API.
+test "socket: TCP connect/accept/echo over loopback" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var ip4 = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ip4.protocol());
+    const tcp_proto = tcp_mod.TCPProtocol.init(allocator); // freed by s.deinit (vtable)
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var lo = loopback.Loopback.init(allocator);
+    defer lo.deinit();
+    try s.createLoopbackNIC(1, lo.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const my_ip = tcpip.Address{ .v4 = .{ 10, 0, 0, 1 } };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = my_ip, .prefix_len = 24 } });
+    try s.addLinkAddress(my_ip, lo.linkEndpoint().linkAddress());
+
+    var server = try Socket.tcp(&s);
+    defer server.close();
+    try server.bind(addr4(1, 10, 0, 0, 1, 8080));
+    try server.listen(8);
+
+    var client = try Socket.tcp(&s);
+    defer client.close();
+    try client.bind(addr4(1, 10, 0, 0, 1, 0));
+    try client.connect(addr4(1, 10, 0, 0, 1, 8080));
+
+    var conn: ?*Socket = null;
+    var i: usize = 0;
+    while (conn == null and i < 50) : (i += 1) {
+        lo.tick();
+        _ = s.timer_queue.tick();
+        conn = server.accept() catch null;
+    }
+    try std.testing.expect(conn != null);
+    defer conn.?.close();
+
+    const peer = try conn.?.peerAddr();
+    try std.testing.expectEqual((try client.localAddr()).port, peer.port);
+    try std.testing.expectEqual(@as(u16, 8080), (try client.peerAddr()).port);
+
+    _ = try client.send("hello");
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    i = 0;
+    while (i < 50) : (i += 1) {
+        lo.tick();
+        _ = s.timer_queue.tick();
+        n = conn.?.recv(&buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        break;
+    }
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+
+    _ = try conn.?.send(buf[0..n]);
+    var reply: [64]u8 = undefined;
+    var rn: usize = 0;
+    i = 0;
+    while (i < 50) : (i += 1) {
+        lo.tick();
+        _ = s.timer_queue.tick();
+        rn = client.recv(&reply) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        break;
+    }
+    try std.testing.expectEqualStrings("hello", reply[0..rn]);
+}
