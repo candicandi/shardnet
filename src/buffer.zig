@@ -448,15 +448,27 @@ pub const VectorisedView = struct {
     }
 
     pub fn fromSlice(data: []const u8, allocator: Allocator, pool: *ClusterPool) !VectorisedView {
-        const cluster = try pool.acquire();
-        const to_copy = @min(data.len, header.ClusterSize);
-        @memcpy(cluster.data[0..to_copy], data[0..to_copy]);
-        const views = try allocator.alloc(ClusterView, 1);
-        views[0] = .{ .cluster = cluster, .view = cluster.data[0..to_copy] };
+        // Spans as many clusters as the data needs — a single-cluster copy would
+        // silently truncate anything past ClusterSize (e.g. reassembled datagrams).
+        const n_clusters = if (data.len == 0) 1 else (data.len + header.ClusterSize - 1) / header.ClusterSize;
+        const views = try allocator.alloc(ClusterView, n_clusters);
+        errdefer allocator.free(views);
+        var i: usize = 0;
+        errdefer for (views[0..i]) |v| {
+            if (v.cluster) |c| c.release();
+        };
+        var offset: usize = 0;
+        while (i < n_clusters) : (i += 1) {
+            const cluster = try pool.acquire();
+            const to_copy = @min(data.len - offset, header.ClusterSize);
+            @memcpy(cluster.data[0..to_copy], data[offset .. offset + to_copy]);
+            views[i] = .{ .cluster = cluster, .view = cluster.data[0..to_copy] };
+            offset += to_copy;
+        }
         return .{
             .views = views,
             .original_views = views,
-            .size = to_copy,
+            .size = data.len,
             .allocator = allocator,
         };
     }
