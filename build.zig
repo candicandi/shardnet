@@ -188,4 +188,17 @@ pub fn build(b: *std.Build) void {
         const install = b.addInstallArtifact(exe, .{});
         example_step.dependOn(&install.step);
     }
+
+    // -- Interop step --------------------------------------------------------
+    // Standalone TAP interop peer. Pure Zig (no libev/C shim), so it
+    // attaches to a user-owned tap0 with no extra link dependencies.
+    const interop_step = b.step("interop", "Build the TAP interop binary");
+    const interop_exe = b.addExecutable(.{
+        .name = "interop_tap",
+        .root_source_file = b.path("examples/interop_tap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    interop_exe.root_module.addImport("shardnet", shardnet_mod);
+    interop_step.dependOn(&b.addInstallArtifact(interop_exe, .{}).step);
 }
