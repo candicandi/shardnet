@@ -153,6 +153,8 @@ pub fn parseExtensionHeaders(data: []const u8, first_next_header: u8) ExtensionH
 }
 
 pub const IPv6Protocol = struct {
+    owner_allocator: ?std.mem.Allocator = null,
+
     pub fn init() IPv6Protocol {
         return .{};
     }
@@ -169,7 +171,13 @@ pub const IPv6Protocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*IPv6Protocol, @ptrCast(@alignCast(ptr)));
+        if (self.owner_allocator) |a| a.destroy(self);
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;

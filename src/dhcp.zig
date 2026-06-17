@@ -681,7 +681,11 @@ fn injectReply(nic: *stack.NIC, src_ip: [4]u8, dst_ip: [4]u8, dhcp: []const u8) 
 }
 
 fn setupStack(allocator: std.mem.Allocator, s: *stack.Stack, lo: *loopback.Loopback) !*stack.NIC {
-    var ip4 = ipv4.IPv4Protocol.init();
+    // Heap-allocate so the protocol outlives this helper's return (the stack
+    // holds a pointer to it); owner_allocator lets s.deinit() free it.
+    const ip4 = try allocator.create(ipv4.IPv4Protocol);
+    ip4.* = ipv4.IPv4Protocol.init();
+    ip4.owner_allocator = allocator;
     try s.registerNetworkProtocol(ip4.protocol());
     const udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());

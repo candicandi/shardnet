@@ -82,6 +82,8 @@ pub const ICMPv6Protocol = struct {
 };
 
 pub const ICMPv6TransportProtocol = struct {
+    owner_allocator: ?std.mem.Allocator = null,
+
     pub fn init() ICMPv6TransportProtocol {
         return .{};
     }
@@ -94,8 +96,14 @@ pub const ICMPv6TransportProtocol = struct {
                 .newEndpoint = newTransportEndpoint,
                 .parsePorts = parsePorts,
                 .handlePacket = handlePacket_external,
+                .deinit = deinit_external,
             },
         };
+    }
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*ICMPv6TransportProtocol, @ptrCast(@alignCast(ptr)));
+        if (self.owner_allocator) |a| a.destroy(self);
     }
 
     fn transportNumber(ptr: *anyopaque) tcpip.TransportProtocolNumber {

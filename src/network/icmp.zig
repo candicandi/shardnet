@@ -127,6 +127,7 @@ pub const RttMeasurement = struct {
 
 pub const ICMPv4TransportProtocol = struct {
     rate_limiter: RateLimiter = RateLimiter.init(),
+    owner_allocator: ?std.mem.Allocator = null,
 
     pub fn init() ICMPv4TransportProtocol {
         return .{};
@@ -140,8 +141,14 @@ pub const ICMPv4TransportProtocol = struct {
                 .newEndpoint = newTransportEndpoint,
                 .parsePorts = parsePorts,
                 .handlePacket = handlePacket_external,
+                .deinit = deinit_external,
             },
         };
+    }
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*ICMPv4TransportProtocol, @ptrCast(@alignCast(ptr)));
+        if (self.owner_allocator) |a| a.destroy(self);
     }
 
     fn transportNumber(ptr: *anyopaque) tcpip.TransportProtocolNumber {
@@ -395,6 +402,8 @@ pub const ICMPv4PacketHandler = struct {
 };
 
 pub const ICMPv4Protocol = struct {
+    owner_allocator: ?std.mem.Allocator = null,
+
     pub fn init() ICMPv4Protocol {
         return .{};
     }
@@ -411,7 +420,13 @@ pub const ICMPv4Protocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*ICMPv4Protocol, @ptrCast(@alignCast(ptr)));
+        if (self.owner_allocator) |a| a.destroy(self);
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;

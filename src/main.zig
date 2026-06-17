@@ -162,24 +162,31 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     var s = try stack.Stack.init(allocator);
     errdefer s.deinit();
 
+    // owner_allocator marks each heap-allocated protocol so its vtable deinit
+    // frees it on stack teardown (stack-local test instances leave it null).
     const ipv4_proto = try allocator.create(network.ipv4.IPv4Protocol);
     ipv4_proto.* = network.ipv4.IPv4Protocol.init();
+    ipv4_proto.owner_allocator = allocator;
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     const ipv6_proto = try allocator.create(network.ipv6.IPv6Protocol);
     ipv6_proto.* = network.ipv6.IPv6Protocol.init();
+    ipv6_proto.owner_allocator = allocator;
     try s.registerNetworkProtocol(ipv6_proto.protocol());
 
     const arp_proto = try allocator.create(network.arp.ARPProtocol);
     arp_proto.* = network.arp.ARPProtocol.init(allocator);
+    arp_proto.owner_allocator = allocator;
     try s.registerNetworkProtocol(arp_proto.protocol());
 
     const icmp_proto = try allocator.create(network.icmp.ICMPv4Protocol);
     icmp_proto.* = network.icmp.ICMPv4Protocol.init();
+    icmp_proto.owner_allocator = allocator;
     try s.registerNetworkProtocol(icmp_proto.protocol());
 
     const icmpv4_transport = try allocator.create(network.icmp.ICMPv4TransportProtocol);
     icmpv4_transport.* = network.icmp.ICMPv4TransportProtocol.init();
+    icmpv4_transport.owner_allocator = allocator;
     try s.registerTransportProtocol(icmpv4_transport.protocol());
 
     const tcp_proto = transport.tcp.TCPProtocol.init(allocator);
@@ -190,6 +197,7 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
 
     const icmpv6_proto = try allocator.create(network.icmpv6.ICMPv6TransportProtocol);
     icmpv6_proto.* = network.icmpv6.ICMPv6TransportProtocol.init();
+    icmpv6_proto.owner_allocator = allocator;
     try s.registerTransportProtocol(icmpv6_proto.protocol());
 
     return s;
@@ -230,4 +238,10 @@ pub const utils = @import("utils.zig");
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "init/deinit frees the heap-allocated protocols (no leak)" {
+    const allocator = std.testing.allocator;
+    var s = try init(allocator);
+    s.deinit();
 }

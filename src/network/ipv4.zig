@@ -45,6 +45,8 @@ pub const OptionType = struct {
 };
 
 pub const IPv4Protocol = struct {
+    owner_allocator: ?std.mem.Allocator = null,
+
     pub fn init() IPv4Protocol {
         return .{};
     }
@@ -65,7 +67,8 @@ pub const IPv4Protocol = struct {
     };
 
     fn deinit_external(ptr: *anyopaque) void {
-        _ = ptr;
+        const self = @as(*IPv4Protocol, @ptrCast(@alignCast(ptr)));
+        if (self.owner_allocator) |a| a.destroy(self);
     }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {

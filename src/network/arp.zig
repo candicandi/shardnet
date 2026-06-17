@@ -69,6 +69,7 @@ pub const ARPProtocol = struct {
     /// Policy for handling cache updates that would change an existing mapping.
     /// Defaults to .alert which logs potential spoofing but allows the update.
     update_policy: CacheUpdatePolicy = .alert,
+    owner_allocator: ?std.mem.Allocator = null,
 
     pub fn init(allocator: std.mem.Allocator) ARPProtocol {
         return .{
@@ -192,7 +193,19 @@ pub const ARPProtocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    // Only a heap-owned instance (owner_allocator set by stack bring-up) frees
+    // itself and its cache here; stack-local test instances leave it null and
+    // are torn down by their own `defer proto.deinit()`.
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*ARPProtocol, @ptrCast(@alignCast(ptr)));
+        if (self.owner_allocator) |a| {
+            self.cache.deinit();
+            a.destroy(self);
+        }
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;
