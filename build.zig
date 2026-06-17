@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/transport/tcp_test.zig", .run = true },
         .{ .path = "src/transport/tcp_2msl_test.zig", .run = true },
         .{ .path = "src/fuzz_test.zig", .run = true },
+        .{ .path = "src/wire_conformance_test.zig", .run = true },
     };
 
     for (test_files) |tf| {
