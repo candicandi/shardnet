@@ -15,6 +15,13 @@ const TUNSETIFF: u32 = 0x400454ca;
 const IFF_TAP: u16 = 0x0002;
 const IFF_NO_PI: u16 = 0x1000;
 
+const HTTP_RESPONSE =
+    "HTTP/1.0 200 OK\r\n" ++
+    "Content-Type: text/plain\r\n" ++
+    "Connection: close\r\n" ++
+    "\r\n" ++
+    "Hello from shardnet over TAP!\n";
+
 const TunIfreq = extern struct {
     name: [16]u8 = [_]u8{0} ** 16,
     flags: i16 = 0,
@@ -54,7 +61,14 @@ pub fn main() !void {
     try nic.addAddress(.{ .protocol = shardnet.network.icmp.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
     try s.addRoute(.{ .destination = .{ .address = .{ .v4 = .{ 10, 9, 0, 0 } }, .prefix = 24 }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = 1500 });
 
-    std.debug.print("interop: tap0 attached, shardnet = 10.9.0.2/24; serving\n", .{});
+    const listener = try shardnet.socket.Socket.tcp(&s);
+    defer listener.close();
+    try listener.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 9, 0, 2 } }, .port = 8080 });
+    try listener.listen(8);
+
+    std.debug.print("interop: tap0 attached, shardnet = 10.9.0.2/24; HTTP on :8080\n", .{});
+
+    var conns = [_]?*shardnet.socket.Socket{null} ** 16;
 
     var fds = [_]std.posix.pollfd{.{ .fd = tap.fd, .events = std.posix.POLL.IN, .revents = 0 }};
     while (true) {
@@ -63,5 +77,26 @@ pub fn main() !void {
             while (tap.readPacket() catch false) {}
         }
         _ = s.timer_queue.tick();
+
+        while (listener.readable()) {
+            const conn = listener.accept() catch break;
+            for (&conns) |*slot| {
+                if (slot.* == null) {
+                    slot.* = conn;
+                    break;
+                }
+            } else conn.close();
+        }
+
+        for (&conns) |*slot| {
+            const c = slot.* orelse continue;
+            if (c.readable()) {
+                var rbuf: [2048]u8 = undefined;
+                _ = c.recv(&rbuf) catch {};
+                _ = c.send(HTTP_RESPONSE) catch {};
+                c.close();
+                slot.* = null;
+            }
+        }
     }
 }
