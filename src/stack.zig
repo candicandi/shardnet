@@ -402,11 +402,38 @@ pub const NIC = struct {
         }
     }
 
+    // Register an address while reusing an existing per-protocol endpoint
+    // instead of rebuilding it. addAddress() recreates the endpoint on every
+    // call (IPv6 depends on that to run DAD per address), but DHCP applies its
+    // leased IPv4 address from inside packet dispatch — recreating there would
+    // free the very endpoint still on the call stack. Safe only where the
+    // endpoint does not key off its stored address (IPv4).
+    pub fn addAddressReusingEndpoint(self: *NIC, addr: tcpip.ProtocolAddress) !void {
+        if (self.network_endpoints.get(addr.protocol) == null) {
+            return self.addAddress(addr);
+        }
+        try self.addresses.append(addr);
+    }
+
     pub fn hasAddress(self: *NIC, addr: tcpip.Address) bool {
         for (self.addresses.items) |pa| {
             if (pa.address_with_prefix.address.eq(addr)) return true;
         }
         return false;
+    }
+
+    // The per-protocol network endpoint is shared across a protocol's addresses,
+    // so it is left intact — only the address entry is dropped (used by DHCP on
+    // lease release/expiry to relinquish a leased address).
+    pub fn removeAddress(self: *NIC, addr: tcpip.Address) void {
+        var i: usize = 0;
+        while (i < self.addresses.items.len) {
+            if (self.addresses.items[i].address_with_prefix.address.eq(addr)) {
+                _ = self.addresses.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     pub fn attach(self: *NIC) void {
@@ -954,6 +981,20 @@ pub const Stack = struct {
 
     pub fn addRoute(self: *Stack, route: RouteEntry) !void {
         try self.route_table.addRoute(route);
+    }
+
+    pub fn removeRoute(self: *Stack, route: RouteEntry) bool {
+        for (self.route_table.routes.items, 0..) |r, i| {
+            if (r.nic == route.nic and
+                r.destination.prefix == route.destination.prefix and
+                r.destination.address.eq(route.destination.address) and
+                r.gateway.eq(route.gateway))
+            {
+                _ = self.route_table.routes.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn setRouteTable(self: *Stack, routes: []const RouteEntry) !void {
