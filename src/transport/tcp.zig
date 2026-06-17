@@ -1035,6 +1035,9 @@ pub const TCPEndpoint = struct {
                 r.remote_link_address = link_addr;
             }
         }
+        // Resolve the egress endpoint before acquiring any header buffers: a
+        // mid-loop bail after acquiring would strand them in packet_batch and leak.
+        const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse return;
         var packet_batch: [64]tcpip.PacketBuffer = undefined;
         var batch_count: usize = 0;
         const now = std.time.milliTimestamp();
@@ -1088,7 +1091,6 @@ pub const TCPEndpoint = struct {
             node.data.timestamp = now;
             batch_count += 1;
             if (batch_count == 64) {
-                const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse break;
                 net_ep.writePackets(r, ProtocolNumber, packet_batch[0..batch_count]) catch |err| {
                     for (packet_batch[0..batch_count]) |p| self.proto.header_pool.release(p.header.buf);
                     return err;
@@ -1099,7 +1101,6 @@ pub const TCPEndpoint = struct {
             it = node.next;
         }
         if (batch_count > 0) {
-            const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse return;
             net_ep.writePackets(r, ProtocolNumber, packet_batch[0..batch_count]) catch |err| {
                 for (packet_batch[0..batch_count]) |p| self.proto.header_pool.release(p.header.buf);
                 return err;
