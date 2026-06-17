@@ -279,7 +279,9 @@ pub const UDPEndpoint = struct {
             @as(u16, @intCast(header.UDPMinimumSize + data.size));
         h.setLength(pkt_len);
 
-        // Calculate checksum (may use hardware offload)
+        // The checksum field must read as 0 while summing; hdr_buf is pool-allocated
+        // and not zeroed, so clear it explicitly or the on-wire checksum is wrong.
+        h.setChecksum(0);
         const csum = self.calculateChecksum(&h, local_address.addr, r.remote_address, data);
         h.setChecksum(csum);
 
