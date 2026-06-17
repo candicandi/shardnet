@@ -218,22 +218,27 @@ pub const ICMPv4PacketHandler = struct {
 
     fn handleEchoRequest(s: *stack.Stack, r: *const stack.Route, pkt: *tcpip.PacketBuffer, v: []const u8) void {
         _ = pkt;
-        const payload = s.allocator.alloc(u8, v.len) catch return;
-        defer s.allocator.free(payload);
-        @memcpy(payload, v);
+        if (v.len < header.ICMPv4MinimumSize) return;
 
-        var reply_hdr = [_]u8{0} ** header.ICMPv4MinimumSize;
-        @memcpy(&reply_hdr, payload[0..header.ICMPv4MinimumSize]);
-        var reply_h = header.ICMPv4.init(&reply_hdr);
+        // The whole ICMP message (header + echo data) is the L4 payload; the
+        // header Prependable must reserve room for the IP and link headers. A TAP
+        // link prepends a 14-byte Ethernet header, which initFull leaves no room for.
+        const msg = s.allocator.alloc(u8, v.len) catch return;
+        defer s.allocator.free(msg);
+        @memcpy(msg, v);
+
+        var reply_h = header.ICMPv4.init(msg[0..header.ICMPv4MinimumSize]);
         reply_h.data[0] = Type.ECHO_REPLY;
         reply_h.setChecksum(0);
-        const c = reply_h.calculateChecksum(payload[header.ICMPv4MinimumSize..]);
-        reply_h.setChecksum(c);
+        reply_h.setChecksum(reply_h.calculateChecksum(msg[header.ICMPv4MinimumSize..]));
 
-        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = payload[header.ICMPv4MinimumSize..] }};
+        const hdr_mem = s.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
+        defer s.allocator.free(hdr_mem);
+
+        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = msg }};
         const reply_pkt = tcpip.PacketBuffer{
-            .data = buffer.VectorisedView.init(payload.len - header.ICMPv4MinimumSize, &views),
-            .header = buffer.Prependable.initFull(&reply_hdr),
+            .data = buffer.VectorisedView.init(msg.len, &views),
+            .header = buffer.Prependable.init(hdr_mem),
         };
 
         const reply_route = r.*;
