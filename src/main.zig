@@ -30,6 +30,7 @@ pub const link = struct {
     pub const eth = @import("link/eth.zig");
 };
 pub const dns = @import("dns.zig");
+pub const dhcp = @import("dhcp.zig");
 pub const socket = @import("socket.zig");
 // posix and event_mux are Linux-only (timerfd, raw syscalls); gate like the drivers
 // so refAllDecls in tests doesn't force them to compile on macOS/BSD.
