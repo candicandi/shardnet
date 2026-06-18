@@ -81,6 +81,7 @@ pub const UDPProtocol = struct {
     fn parsePorts(ptr: *anyopaque, pkt: tcpip.PacketBuffer) stack.TransportProtocol.PortPair {
         _ = ptr;
         const v = pkt.data.first() orelse return .{ .src = 0, .dst = 0 };
+        if (v.len < 4) return .{ .src = 0, .dst = 0 };
         const h = header.UDP.init(v);
         return .{ .src = h.sourcePort(), .dst = h.destinationPort() };
     }
@@ -568,6 +569,18 @@ pub const UDPEndpoint = struct {
         return self.remote_addr orelse tcpip.Error.InvalidEndpointState;
     }
 };
+
+test "UDP parsePorts rejects a segment too short to hold both ports" {
+    var bytes = [_]u8{ 0x12, 0x34, 0x56 };
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = &bytes }};
+    const pkt = tcpip.PacketBuffer{
+        .data = buffer.VectorisedView.init(bytes.len, &views),
+        .header = buffer.Prependable.init(&[_]u8{}),
+    };
+    const ports = UDPProtocol.parsePorts(undefined, pkt);
+    try std.testing.expectEqual(@as(u16, 0), ports.src);
+    try std.testing.expectEqual(@as(u16, 0), ports.dst);
+}
 
 test "UDP handlePacket" {
     const allocator = std.testing.allocator;
