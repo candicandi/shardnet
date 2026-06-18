@@ -902,3 +902,72 @@ test "TCP RST handling in ESTABLISHED follows RFC 5961" {
     var wuio = buffer.Uio.init(&wiov);
     try std.testing.expectError(tcpip.Error.ConnectionReset, ep.endpoint().writev(&wuio, .{}));
 }
+
+test "ARP pending queue retransmits a deep copy once the next hop resolves" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var mock = MockLinkEndpoint{ .allocator = allocator };
+    defer mock.deinit();
+    try s.createNIC(1, mock.linkEndpoint());
+    const nic = s.nics.get(1).?;
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = .{ 10, 0, 0, 1 } }, .prefix_len = 24 } });
+
+    const dst = tcpip.Address{ .v4 = .{ 10, 0, 0, 2 } };
+    var r = stack.Route{
+        .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .remote_address = dst,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+
+    // A sender builds a pooled header + a payload, then frees both on the
+    // WouldBlock return: the queue must have deep-copied them to survive that.
+    const hdr_buf = try tcp_proto.header_pool.acquire();
+    var pre = buffer.Prependable.init(hdr_buf);
+    const l4 = pre.prepend(20).?;
+    @memset(l4, 0xAB);
+    var payload = try buffer.VectorisedView.fromSlice("hello-arp", allocator, &s.cluster_pool);
+    const pb = tcpip.PacketBuffer{ .data = payload, .header = pre };
+
+    try std.testing.expectError(tcpip.Error.WouldBlock, r.writePacket(6, pb));
+    // The sender's WouldBlock contract: release the buffers it just handed down.
+    payload.deinit();
+    tcp_proto.header_pool.release(hdr_buf);
+
+    // Still queued, nothing on the wire yet.
+    try std.testing.expect(mock.last_pkt == null);
+
+    // Resolving the next hop drains the queue and retransmits.
+    try s.addLinkAddress(dst, .{ .addr = [_]u8{ 1, 2, 3, 4, 5, 6 } });
+
+    const cap = mock.last_pkt orelse return error.TestExpectedRetransmit;
+    // IPv4(20) + the queued L4 header(20) + payload(9).
+    try std.testing.expectEqual(@as(usize, 20 + 20 + 9), cap.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xAB} ** 20, cap[20..40]);
+    try std.testing.expectEqualSlices(u8, "hello-arp", cap[40..49]);
+
+    // A second packet to a next hop that never resolves must be freed by
+    // stack teardown rather than leaked (GPA enforces this on s.deinit()).
+    const dst2 = tcpip.Address{ .v4 = .{ 10, 0, 0, 9 } };
+    var r2 = stack.Route{
+        .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .remote_address = dst2,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+    const hdr_buf2 = try tcp_proto.header_pool.acquire();
+    var pre2 = buffer.Prependable.init(hdr_buf2);
+    _ = pre2.prepend(20).?;
+    var payload2 = try buffer.VectorisedView.fromSlice("orphan", allocator, &s.cluster_pool);
+    try std.testing.expectError(tcpip.Error.WouldBlock, r2.writePacket(6, .{ .data = payload2, .header = pre2 }));
+    payload2.deinit();
+    tcp_proto.header_pool.release(hdr_buf2);
+}
