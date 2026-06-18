@@ -413,6 +413,32 @@ test "TCP CWND enforcement" {
     try std.testing.expectEqual(@as(usize, 0), ep.ooo_list.len);
 }
 
+test "TCP writable() is gated on a write-capable state" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var wq = waiter.Queue{};
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep: *TCPEndpoint = @ptrCast(@alignCast(ep_res.ptr));
+    defer ep.close();
+    const orig_state = ep.state;
+
+    // The stack notifies EventOut to every endpoint when a link address resolves
+    // (the ARP-retry wake, stack.zig). A connecting endpoint must still report
+    // not-writable, or a non-blocking connect looks complete before the handshake.
+    wq.notify(waiter.EventOut);
+    ep.state = .syn_sent;
+    try std.testing.expect(!ep_res.ready(waiter.EventOut));
+    ep.state = .established;
+    try std.testing.expect(ep_res.ready(waiter.EventOut));
+    ep.state = orig_state;
+}
+
 test "TCP SACK blocks generation" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();

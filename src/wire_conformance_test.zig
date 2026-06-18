@@ -1,11 +1,7 @@
-// Wire-format conformance: assert shardnet's serialized header bytes match an
-// independent oracle (scapy) byte-for-byte, checksum included. Loopback is
-// symmetric, so an encoding/endianness/checksum/offset bug cancels out there and
-// passes; comparing against externally-produced bytes is what catches it.
-//
-// The golden_* arrays are the bytes scapy (an independent implementation)
-// produces for the same logical packet; baking them in keeps this test free of
-// any runtime dependency on the oracle.
+// Wire-format conformance: shardnet's emitted bytes must equal an independent
+// oracle's (scapy), byte-for-byte including checksums. Loopback is symmetric, so
+// an encoding/checksum/endianness bug cancels out and passes there; only an
+// external comparison catches it. golden_* are scapy's bytes, baked in.
 const std = @import("std");
 const shardnet = @import("shardnet");
 const header = shardnet.header;
@@ -30,7 +26,7 @@ const golden_arp_request = [_]u8{ 0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01
 const golden_ipv6_hdr = [_]u8{ 0x60, 0x00, 0x00, 0x00, 0x00, 0x14, 0x06, 0x40, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 };
 const golden_icmp6_echo_request = [_]u8{ 0x80, 0x00, 0xde, 0xe5, 0x12, 0x34, 0x00, 0x01, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68 };
 
-// Stack-capture goldens: the full L3 frame the real stack hands to the link layer.
+// Stack-capture goldens (full L3 frames).
 const golden_udp_dgram = [_]u8{ 0x45, 0x00, 0x00, 0x21, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x26, 0xca, 0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x00, 0x02, 0x04, 0xd2, 0x16, 0x2e, 0x00, 0x0d, 0x8c, 0xff, 0x68, 0x65, 0x6c, 0x6c, 0x6f };
 const golden_syn_ip = [_]u8{ 0x45, 0x00, 0x00, 0x34, 0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x26, 0xc2, 0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x00, 0x02 };
 const golden_syn_tcp = [_]u8{ 0x04, 0xd2, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x02, 0x10, 0x00, 0x4a, 0xe9, 0x00, 0x00, 0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x0e, 0x00, 0x00, 0x00, 0x00 };
@@ -103,8 +99,7 @@ test "wire: ICMPv6 echo request + pseudo-header checksum" {
     try std.testing.expectEqualSlices(u8, &golden_icmp6_echo_request, &buf);
 }
 
-// Records the linearized L3 frame (prepended headers + data) the stack would
-// transmit, instead of sending it.
+// Captures the linearized L3 frame the stack would transmit, instead of sending it.
 const Capture = struct {
     last_pkt: ?[]u8 = null,
     allocator: std.mem.Allocator,
@@ -262,8 +257,7 @@ fn putOpt(buf: []u8, i: *usize, code: u8, data: []const u8) void {
     i.* += 2 + data.len;
 }
 
-// Minimal DHCP OFFER (yiaddr 192.168.1.50, server 192.168.1.1) the client will
-// accept and answer with a select REQUEST, used to drive the REQUEST capture.
+// Builds a DHCP OFFER the client accepts, so it answers with a select REQUEST.
 fn buildOffer(buf: []u8, xid: u32) usize {
     @memset(buf[0..240], 0);
     buf[0] = 2; // BOOTREPLY
@@ -361,6 +355,53 @@ test "wire: DHCPv4 REQUEST (options 50/54 echoed from OFFER)" {
     @memset(frame[32..36], 0); // xid (random)
     @memset(frame[36..38], 0); // secs (elapsed)
     try std.testing.expectEqualSlices(u8, &golden_dhcp_request, frame[28..]);
+}
+
+// Regression: an ICMP echo reply must transmit through the real assembly path
+// (IP header prepended onto the reply). The reply used to be built in a
+// zero-headroom Prependable and failed with NoBufferSpace, so no frame was sent.
+test "wire: ICMPv4 echo reply transmits through the assembly path" {
+    const allocator = std.testing.allocator;
+    var s = try shardnet.init(allocator); // full protocol set, incl. ICMP transport
+    defer s.deinit();
+
+    var cap = Capture{ .allocator = allocator };
+    defer cap.deinit();
+    try s.createNIC(1, cap.linkEndpoint());
+    const nic = s.nics.get(1).?;
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = .{ 10, 9, 0, 2 } }, .prefix_len = 24 } });
+    try nic.addAddress(.{ .protocol = shardnet.network.arp.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
+    try nic.addAddress(.{ .protocol = shardnet.network.icmp.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
+    try s.addLinkAddress(.{ .v4 = .{ 10, 9, 0, 1 } }, .{ .addr = [_]u8{0} ** 6 });
+
+    // IPv4 (proto 1) + ICMP echo request from 10.9.0.1, with valid checksums.
+    var frame: [32]u8 = undefined;
+    @memset(&frame, 0);
+    frame[0] = 0x45;
+    std.mem.writeInt(u16, frame[2..4], 32, .big);
+    frame[8] = 64; // ttl
+    frame[9] = 1; // ICMP
+    @memcpy(frame[12..16], &[_]u8{ 10, 9, 0, 1 });
+    @memcpy(frame[16..20], &[_]u8{ 10, 9, 0, 2 });
+    const iph = header.IPv4.init(frame[0..20]);
+    iph.setChecksum(iph.calculateChecksum());
+    frame[20] = header.ICMPv4EchoType;
+    std.mem.writeInt(u16, frame[24..26], 0x1234, .big);
+    std.mem.writeInt(u16, frame[26..28], 1, .big);
+    const icmph = header.ICMPv4.init(frame[20..32]);
+    icmph.setChecksum(icmph.calculateChecksum(frame[28..32]));
+
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = &frame }};
+    const pkt = tcpip.PacketBuffer{ .data = buffer.VectorisedView.init(frame.len, &views), .header = buffer.Prependable.init(&[_]u8{}) };
+    const remote = tcpip.LinkAddress{ .addr = .{ 0x02, 0, 0, 0, 0, 0x01 } };
+    const local = nic.linkEP.linkAddress();
+    nic.dispatcher.deliverNetworkPacket(&remote, &local, ipv4.ProtocolNumber, pkt);
+
+    try std.testing.expect(cap.last_pkt != null);
+    const reply = cap.last_pkt.?;
+    try std.testing.expectEqual(@as(usize, 32), reply.len); // IPv4(20) + ICMP(8+4)
+    try std.testing.expectEqual(@as(u8, 1), reply[9]); // IP proto ICMP
+    try std.testing.expectEqual(header.ICMPv4EchoReplyType, reply[20]); // type 0
 }
 
 
