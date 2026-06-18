@@ -803,6 +803,11 @@ pub const TCPEndpoint = struct {
     }
 
     fn notify(self: *TCPEndpoint, mask: waiter.EventMask) void {
+        // A socket-owned waiter queue (owns_waiter_queue == false) is freed by the
+        // socket on close, yet the endpoint can linger in TIME_WAIT and keep
+        // processing packets; touching that queue afterward is a use-after-free.
+        // Endpoint-owned queues live until the endpoint is destroyed, so stay safe.
+        if (self.app_closed and !self.owns_waiter_queue) return;
         if (!self.app_closed or (mask & (waiter.EventHUp | waiter.EventErr) != 0)) {
             self.waiter_queue.notify(mask);
         }
@@ -2297,6 +2302,24 @@ test "TCP parsePorts rejects a segment too short to hold both ports" {
     const ports = TCPProtocol.parsePorts(undefined, pkt);
     try std.testing.expectEqual(@as(u16, 0), ports.src);
     try std.testing.expectEqual(@as(u16, 0), ports.dst);
+}
+
+test "notify after app close skips a socket-owned (freed) waiter queue" {
+    var sentinel = waiter.Queue{};
+    var ep: TCPEndpoint = undefined;
+    ep.app_closed = true;
+    ep.waiter_queue = &sentinel;
+
+    // Socket-owned queue: the socket frees it on close, so a lingering endpoint must
+    // not notify it (pre-fix this wrote through to freed memory).
+    ep.owns_waiter_queue = false;
+    ep.notify(waiter.EventErr | waiter.EventHUp);
+    try std.testing.expectEqual(@as(waiter.EventMask, 0), sentinel.ready_mask);
+
+    // Endpoint-owned queue lives as long as the endpoint, so it is still notified.
+    ep.owns_waiter_queue = true;
+    ep.notify(waiter.EventErr | waiter.EventHUp);
+    try std.testing.expect(sentinel.ready_mask != 0);
 }
 
 test "NewReno slow start" {
