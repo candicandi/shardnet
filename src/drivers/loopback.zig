@@ -97,9 +97,13 @@ pub const Loopback = struct {
         /// A fixed seed (the default of 0) guarantees reproducible test runs.
         prng_seed: u64 = 0,
 
-        /// Maximum number of idle queue nodes kept in the free-list.
-        /// Excess nodes are returned to the backing allocator on release.
-        node_pool_capacity: usize = 64,
+        /// Hard ceiling on packets queued for delivery at once (also the idle
+        /// free-list cap). Nodes are allocated on demand up to this limit, so memory
+        /// tracks the actual peak queue depth, not the cap. Matches the cluster pool
+        /// (65536) so a burst cannot exhaust one before the other; a smaller value
+        /// would make writePacket return OutOfMemory once the queue exceeds it
+        /// (e.g. under a wide simultaneous-connection burst).
+        node_pool_capacity: usize = 65536,
     };
 
     /// Point-in-time snapshot of the driver counters.
@@ -346,3 +350,22 @@ pub const Loopback = struct {
         return stack.CapabilityLoopback;
     }
 };
+
+test "loopback queue holds a burst wider than the old 64-node cap" {
+    const allocator = std.testing.allocator;
+    var lo = Loopback.init(allocator);
+    defer lo.deinit();
+
+    var hdr_bytes = [_]u8{0xAB} ** 20;
+    // Enqueue a 128-wide burst with no tick in between; the node pool used to cap
+    // at 64, so writePacket returned OutOfMemory at the 65th packet.
+    var i: usize = 0;
+    while (i < 128) : (i += 1) {
+        const pkt = tcpip.PacketBuffer{
+            .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
+            .header = buffer.Prependable.initFull(&hdr_bytes),
+        };
+        try Loopback.writePacket(&lo, null, 0x0800, pkt);
+    }
+    try std.testing.expectEqual(@as(u64, 128), lo.loopback_tx);
+}
