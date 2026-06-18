@@ -531,6 +531,36 @@ test "TCP out-of-order queue is bounded by the receive window" {
     try std.testing.expectEqual(@as(usize, 100), ep.rcv_buf_used);
 }
 
+test "insertOOO releases the node when segment cloning fails" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var wq = waiter.Queue{};
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep: *TCPEndpoint = @ptrCast(@alignCast(ep_res.ptr));
+    defer ep.close();
+    ep.state = .established;
+    ep.rcv_nxt = 1000;
+    ep.rcv_wnd_max = 65536;
+
+    // A source with more than MaxViewsPerPacket (16) views makes cloneInPool fail
+    // after insertOOO has already acquired a packet node. The node must be
+    // released, not leaked: a leak permanently wedges the shared pool.
+    var bytes = [_]u8{'Z'} ** 17;
+    var views: [17]buffer.ClusterView = undefined;
+    for (&views, 0..) |*v, i| v.* = .{ .cluster = null, .view = bytes[i .. i + 1] };
+    const src = buffer.VectorisedView.init(bytes.len, &views);
+
+    const nodes_before = ep.proto.packet_node_pool.outstanding;
+    try std.testing.expectError(error.OutOfMemory, ep.insertOOO(2000, src));
+    try std.testing.expectEqual(nodes_before, ep.proto.packet_node_pool.outstanding);
+}
+
 test "Stack caps the number of live transport endpoints" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
