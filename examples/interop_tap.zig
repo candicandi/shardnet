@@ -8,6 +8,7 @@
 //   zig build interop
 //   ./zig-out/bin/interop_tap            # server: HTTP on 10.9.0.2:8080
 //   ./zig-out/bin/interop_tap client     # client: connects out to 10.9.0.1:9000
+//   ./zig-out/bin/interop_tap dhcp        # DHCP client: leases its address
 const std = @import("std");
 const shardnet = @import("shardnet");
 
@@ -23,6 +24,8 @@ const HTTP_RESPONSE =
     "Hello from shardnet over TAP!\n";
 
 const CLIENT_PAYLOAD = "hello from shardnet over TAP\n";
+
+const Mode = enum { server, client, dhcp };
 
 const TunIfreq = extern struct {
     name: [16]u8 = [_]u8{0} ** 16,
@@ -51,7 +54,12 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    const client_mode = args.len > 1 and std.mem.eql(u8, args[1], "client");
+    const mode: Mode = if (args.len > 1 and std.mem.eql(u8, args[1], "client"))
+        .client
+    else if (args.len > 1 and std.mem.eql(u8, args[1], "dhcp"))
+        .dhcp
+    else
+        .server;
 
     var s = try shardnet.init(allocator);
     defer s.deinit();
@@ -60,36 +68,48 @@ pub fn main() !void {
     var tap = shardnet.drivers.tap.Tap.initFromFd(fd);
     var eth = shardnet.link.eth.EthernetEndpoint.init(tap.linkEndpoint(), tap.address);
     try s.createNIC(1, eth.linkEndpoint());
-
     const nic = s.nics.get(1).?;
-    try nic.addAddress(.{ .protocol = shardnet.network.ipv4.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 10, 9, 0, 2 } }, .prefix_len = 24 } });
-    try nic.addAddress(.{ .protocol = shardnet.network.arp.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
-    try nic.addAddress(.{ .protocol = shardnet.network.icmp.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
-    try s.addRoute(.{ .destination = .{ .address = .{ .v4 = .{ 10, 9, 0, 0 } }, .prefix = 24 }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = 1500 });
 
     var listener: ?*shardnet.socket.Socket = null;
     var client: ?*shardnet.socket.Socket = null;
+    var dhcp_client: ?*shardnet.dhcp.Client = null;
     defer if (listener) |l| l.close();
     defer if (client) |c| c.close();
+    defer if (dhcp_client) |dc| dc.destroy();
     var conns = [_]?*shardnet.socket.Socket{null} ** 16;
     var sent = false;
+    var dhcp_bound = false;
 
-    if (client_mode) {
-        const c = try shardnet.socket.Socket.tcp(&s);
-        try c.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 9, 0, 2 } }, .port = 0 });
-        // WouldBlock just means the SYN is queued behind ARP; the retransmit timer
-        // sends it once the kernel answers, so it is not a failure here.
-        c.connect(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 9, 0, 1 } }, .port = 9000 }) catch |err| {
-            if (err != error.WouldBlock) return err;
-        };
-        client = c;
-        std.debug.print("interop: tap0 attached, 10.9.0.2/24; connecting to 10.9.0.1:9000\n", .{});
-    } else {
-        const l = try shardnet.socket.Socket.tcp(&s);
-        try l.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 9, 0, 2 } }, .port = 8080 });
-        try l.listen(8);
-        listener = l;
-        std.debug.print("interop: tap0 attached, 10.9.0.2/24; HTTP on :8080\n", .{});
+    switch (mode) {
+        .dhcp => {
+            // The DHCP client brings the interface up with 0.0.0.0 itself and
+            // installs the leased address/route/DNS, so don't pre-configure one.
+            const dc = try shardnet.dhcp.Client.create(&s, 1, tap.address.addr);
+            try dc.start();
+            dhcp_client = dc;
+            std.debug.print("interop: tap0 attached; DHCP DISCOVER sent, awaiting lease\n", .{});
+        },
+        .server, .client => {
+            try nic.addAddress(.{ .protocol = shardnet.network.ipv4.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 10, 9, 0, 2 } }, .prefix_len = 24 } });
+            try nic.addAddress(.{ .protocol = shardnet.network.arp.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
+            try nic.addAddress(.{ .protocol = shardnet.network.icmp.ProtocolNumber, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
+            try s.addRoute(.{ .destination = .{ .address = .{ .v4 = .{ 10, 9, 0, 0 } }, .prefix = 24 }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = 1500 });
+            if (mode == .client) {
+                const c = try shardnet.socket.Socket.tcp(&s);
+                try c.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 9, 0, 2 } }, .port = 0 });
+                c.connect(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 9, 0, 1 } }, .port = 9000 }) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+                client = c;
+                std.debug.print("interop: tap0 attached, 10.9.0.2/24; connecting to 10.9.0.1:9000\n", .{});
+            } else {
+                const l = try shardnet.socket.Socket.tcp(&s);
+                try l.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 9, 0, 2 } }, .port = 8080 });
+                try l.listen(8);
+                listener = l;
+                std.debug.print("interop: tap0 attached, 10.9.0.2/24; HTTP on :8080\n", .{});
+            }
+        },
     }
 
     var fds = [_]std.posix.pollfd{.{ .fd = tap.fd, .events = std.posix.POLL.IN, .revents = 0 }};
@@ -129,6 +149,17 @@ pub fn main() !void {
                 c.close(); // half-close so the peer sees EOF and flushes
                 client = null;
                 sent = true;
+            }
+        }
+
+        if (dhcp_client) |dc| {
+            if (!dhcp_bound and dc.state == .bound) {
+                dhcp_bound = true;
+                const a = dc.boundAddress() orelse [_]u8{ 0, 0, 0, 0 };
+                std.debug.print("interop: DHCP bound {d}.{d}.{d}.{d}/{d}\n", .{ a[0], a[1], a[2], a[3], dc.lease.prefix_len });
+                if (dc.lease.gateway) |gw| std.debug.print("interop: gateway {d}.{d}.{d}.{d}\n", .{ gw[0], gw[1], gw[2], gw[3] });
+                const dns = dc.dnsServers();
+                if (dns.len > 0) std.debug.print("interop: dns {d}.{d}.{d}.{d}\n", .{ dns[0][0], dns[0][1], dns[0][2], dns[0][3] });
             }
         }
     }
