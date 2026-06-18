@@ -1,8 +1,9 @@
 const std = @import("std");
 
 // Token bucket rate limiter shared across protocols (ICMP, ARP, TCP SYN). Allows
-// bursts up to max_tokens, then refill_rate tokens per second sustained. Backed by
-// the monotonic millisecond clock, so it is immune to wall-clock adjustments.
+// bursts up to max_tokens, then refill_rate tokens per second sustained. Uses the
+// millisecond wall clock; forward jumps refill to the cap (clamped so the narrowing
+// cannot overflow), backward steps reseed instead of stalling.
 pub const RateLimiter = struct {
     max_tokens: u32 = 100,
     tokens: u32 = 100,
@@ -30,8 +31,16 @@ pub const RateLimiter = struct {
             return;
         }
         const elapsed_ms = now - self.last_refill_ms;
+        if (elapsed_ms < 0) {
+            // Wall clock stepped backward; reseed so refills resume promptly.
+            self.last_refill_ms = now;
+            return;
+        }
         if (elapsed_ms >= 1000) {
-            const new_tokens: u32 = @intCast(@divFloor(elapsed_ms * self.refill_rate, 1000));
+            // Clamp before narrowing: a long idle gap or a large forward clock jump
+            // can drive the refill past u32, which would panic the @intCast.
+            const refilled = @divFloor(elapsed_ms * @as(i64, self.refill_rate), 1000);
+            const new_tokens: u32 = if (refilled >= self.max_tokens) self.max_tokens else @intCast(refilled);
             self.tokens = @min(self.max_tokens, self.tokens + new_tokens);
             self.last_refill_ms = now;
         }
@@ -47,4 +56,24 @@ test "token bucket allows a burst then refills" {
         if (limiter.tryConsume()) allowed += 1;
     }
     try std.testing.expectEqual(@as(u32, 5), allowed);
+}
+
+test "token bucket survives a huge elapsed gap without overflowing" {
+    var limiter = RateLimiter.init();
+    limiter.tokens = 0;
+    // Far in the past: the next refill sees an astronomically large elapsed gap,
+    // as a long-idle limiter or a forward clock jump would. The pre-clamp code
+    // narrowed the refill to u32 and panicked here.
+    limiter.last_refill_ms = 1;
+    try std.testing.expect(limiter.tryConsume());
+    try std.testing.expect(limiter.tokens == limiter.max_tokens - 1);
+}
+
+test "token bucket reseeds instead of stalling on a backward clock step" {
+    var limiter = RateLimiter.init();
+    limiter.tokens = 3;
+    const future = std.time.milliTimestamp() + 1_000_000;
+    limiter.last_refill_ms = future;
+    _ = limiter.tryConsume();
+    try std.testing.expect(limiter.last_refill_ms < future);
 }
