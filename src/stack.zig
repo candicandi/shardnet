@@ -71,6 +71,12 @@ pub const Config = struct {
     /// Path MTU discovery: set DF on IPv4 egress and honor ICMP
     /// Fragmentation Needed / Packet Too Big (RFC 1191 / RFC 8201).
     ip_pmtud: bool = true,
+    // IPv6 Router Advertisement handling. Default off: an unauthenticated RA on
+    // an untrusted L2 can hijack the default route and SLAAC-configure addresses,
+    // so RAs are ignored unless explicitly enabled. When enabled, a non-null
+    // allowlist restricts which router source addresses are honored.
+    ipv6_accept_ra: bool = false,
+    ipv6_ra_allowlist: ?[]const tcpip.Address = null,
     /// Unix socket path for health check endpoint (null to disable).
     /// // NOTE: Unix socket provides health monitoring without HTTP dependency.
     health_check_socket: ?[]const u8 = "/tmp/shardnet.sock",

@@ -340,7 +340,26 @@ pub const ICMPv6PacketHandler = struct {
         }
     }
 
+    // RFC 4861 routers are trusted by default, which an attacker on a shared L2
+    // can abuse (a rogue RA installs a default route and SLAAC prefix). Honor an
+    // RA only when accept_ra is set, and only from an allowlisted source if one
+    // is configured.
+    fn raAccepted(s: *stack.Stack, src: tcpip.Address) bool {
+        if (!s.config.ipv6_accept_ra) return false;
+        if (s.config.ipv6_ra_allowlist) |allow| {
+            for (allow) |a| {
+                if (a.eq(src)) return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
     fn handleRouterAdvertisement(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
+        if (!raAccepted(s, r.remote_address)) {
+            stats.global_stats.icmpv6.router_advertisements_ignored.inc();
+            return;
+        }
         if (v.len < header.ICMPv6MinimumSize + 12) return;
         const ra = header.ICMPv6RA.init(@constCast(v[header.ICMPv6MinimumSize..]));
 
@@ -690,6 +709,7 @@ test "ICMPv6 Router Advertisement & SLAAC" {
     const allocator = std.testing.allocator;
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
+    s.config.ipv6_accept_ra = true;
 
     var ipv6_proto = @import("ipv6.zig").IPv6Protocol.init();
     try s.registerNetworkProtocol(ipv6_proto.protocol());
@@ -821,6 +841,82 @@ test "ICMPv6 Router Advertisement & SLAAC" {
         }
     }
     try std.testing.expect(found_default);
+}
+
+test "ICMPv6 Router Advertisement guard ignores RAs by default and off-allowlist" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var ipv6_proto = @import("ipv6.zig").IPv6Protocol.init();
+    try s.registerNetworkProtocol(ipv6_proto.protocol());
+
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return stack.CapabilityNone;
+        }
+    }{};
+    try s.createNIC(1, .{ .ptr = &fake_link, .vtable = &.{
+        .writePacket = @TypeOf(fake_link).writePacket,
+        .attach = @TypeOf(fake_link).attach,
+        .linkAddress = @TypeOf(fake_link).linkAddress,
+        .mtu = @TypeOf(fake_link).mtu,
+        .setMTU = @TypeOf(fake_link).setMTU,
+        .capabilities = @TypeOf(fake_link).capabilities,
+    } });
+    const nic = s.nics.get(1).?;
+
+    const router_addr = tcpip.Address{ .v6 = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    // Minimal RA: router lifetime > 0, no options, so it only installs a default route.
+    var ra_buf = [_]u8{0} ** (header.ICMPv6MinimumSize + 12);
+    ra_buf[0] = header.ICMPv6RouterAdvertisementType;
+    std.mem.writeInt(u16, ra_buf[header.ICMPv6MinimumSize + 2 .. header.ICMPv6MinimumSize + 4][0..2], 1800, .big);
+
+    const r = stack.Route{
+        .local_address = .{ .v6 = [_]u8{0} ** 16 },
+        .remote_address = router_addr,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x86dd,
+        .nic = nic,
+    };
+
+    const hasDefault = struct {
+        fn f(st: *stack.Stack) bool {
+            for (st.getRouteTable()) |re| {
+                if (re.destination.prefix == 0) return true;
+            }
+            return false;
+        }
+    }.f;
+
+    // Default config: RAs are ignored and counted.
+    const ign0 = stats.global_stats.icmpv6.router_advertisements_ignored.load();
+    ICMPv6PacketHandler.handleRouterAdvertisement(&s, &r, &ra_buf);
+    try std.testing.expect(!hasDefault(&s));
+    try std.testing.expectEqual(ign0 + 1, stats.global_stats.icmpv6.router_advertisements_ignored.load());
+
+    // Accepting, but the router is off the allowlist: still ignored.
+    const other = tcpip.Address{ .v6 = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 } };
+    s.config.ipv6_accept_ra = true;
+    s.config.ipv6_ra_allowlist = &[_]tcpip.Address{other};
+    ICMPv6PacketHandler.handleRouterAdvertisement(&s, &r, &ra_buf);
+    try std.testing.expect(!hasDefault(&s));
+
+    // Router on the allowlist: honored.
+    s.config.ipv6_ra_allowlist = &[_]tcpip.Address{router_addr};
+    ICMPv6PacketHandler.handleRouterAdvertisement(&s, &r, &ra_buf);
+    try std.testing.expect(hasDefault(&s));
 }
 
 test "ICMPv6 Packet Too Big updates the PMTU cache" {
