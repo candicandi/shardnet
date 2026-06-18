@@ -1932,6 +1932,9 @@ pub const TCPEndpoint = struct {
                                 .remote_address = new_ep.remote_addr.?.addr,
                             };
                             self.stack.registerTransportEndpoint(new_id, new_ep.transportEndpoint()) catch {
+                                // incStackRef ran above, so drop the stack ref too
+                                // or the rejected endpoint leaks (it is not in the table).
+                                new_ep.decStackRef();
                                 new_ep.decRef();
                                 return;
                             };
