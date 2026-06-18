@@ -471,6 +471,12 @@ pub const IPv6Endpoint = struct {
                 return;
             }
 
+            // Extension headers parsed up to the frame end, not the stated payload
+            // length, so a crafted chain can exceed plen and underflow the cap below.
+            if (plen < ext_result.payload_offset) {
+                log.warn("IPv6: extension headers exceed payload length", .{});
+                return;
+            }
             mut_pkt.data.trimFront(hlen + ext_result.payload_offset);
             mut_pkt.data.capLength(plen - ext_result.payload_offset);
             self.dispatcher.deliverTransportPacket(r, ext_result.next_header, mut_pkt);
@@ -875,4 +881,26 @@ test "IPv6 fragment header parsing" {
     try std.testing.expectEqual(@as(?u16, 0x100), result.fragment_offset);
     try std.testing.expect(result.fragment_more);
     try std.testing.expectEqual(@as(u32, 0x12345678), result.fragment_id);
+}
+
+test "IPv6 drops a packet whose extension headers exceed the payload length" {
+    const allocator = std.testing.allocator;
+    var ip6 = IPv6Protocol.init();
+    var tb: ReassemblyTestBed = undefined;
+    tb.wq = .{};
+    try tb.init(allocator, &ip6);
+    defer tb.deinit();
+
+    // payloadLength says 8 bytes follow, but a 16-byte Hop-by-Hop header parses
+    // past that. The cap subtraction (plen - payload_offset) must not underflow.
+    var pkt: [56]u8 = undefined;
+    const h = header.IPv6.init(pkt[0..header.IPv6MinimumSize]);
+    h.encode(ReassemblyTestBed.peer_addr, ReassemblyTestBed.my_addr, NextHeader.HOP_BY_HOP, 8);
+    pkt[40] = NextHeader.UDP;
+    pkt[41] = 1; // hdr ext len 1 => (1 + 1) * 8 = 16 bytes
+    @memset(pkt[42..56], 0);
+
+    tb.feed(&pkt);
+    var rbuf: [64]u8 = undefined;
+    try std.testing.expectError(tcpip.Error.WouldBlock, tb.recv(&rbuf, null));
 }
