@@ -129,6 +129,7 @@ pub const ICMPv4TransportProtocol = struct {
 
 pub const ICMPv4PacketHandler = struct {
     var rate_limiter: RateLimiter = RateLimiter.init();
+    var echo_reply_limiter: RateLimiter = RateLimiter.init();
 
     pub fn handlePacket(s: *stack.Stack, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {
         var mut_pkt = pkt;
@@ -165,6 +166,13 @@ pub const ICMPv4PacketHandler = struct {
     fn handleEchoRequest(s: *stack.Stack, r: *const stack.Route, pkt: *tcpip.PacketBuffer, v: []const u8) void {
         _ = pkt;
         if (v.len < header.ICMPv4MinimumSize) return;
+
+        // Bound echo-reply emission so a ping flood cannot make us reflect without
+        // limit (mirrors the ICMPv6 echo gate).
+        if (!echo_reply_limiter.tryConsume()) {
+            stats.global_stats.icmp.echo_replies_throttled.inc();
+            return;
+        }
 
         // The whole ICMP message (header + echo data) is the L4 payload; the
         // header Prependable must reserve room for the IP and link headers. A TAP
