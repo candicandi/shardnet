@@ -274,6 +274,7 @@ pub const PoolStats = struct {
     generic_fallback: Counter = .{},
     cluster_exhausted: Counter = .{},
     view_exhausted: Counter = .{},
+    generic_exhausted: Counter = .{},
 
     pub fn reset(self: *PoolStats) void {
         self.cluster_fallback.store(0);
@@ -281,6 +282,7 @@ pub const PoolStats = struct {
         self.generic_fallback.store(0);
         self.cluster_exhausted.store(0);
         self.view_exhausted.store(0);
+        self.generic_exhausted.store(0);
     }
 };
 

@@ -42,6 +42,11 @@ pub const ClusterPool = struct {
     total_releases: u64 = 0,
     allocated: usize = 0,
     peak_allocated: usize = 0,
+    // Hard cap on total clusters (in use + free) the pool will allocate; acquire
+    // applies backpressure past it. max_free caps idle retention so a burst does
+    // not leave the free list permanently inflated.
+    max_clusters: usize = 65536,
+    max_free: usize = 8192,
 
     pub fn init(allocator: Allocator) ClusterPool {
         return .{
@@ -62,7 +67,8 @@ pub const ClusterPool = struct {
     }
 
     pub fn prewarm(self: *ClusterPool, count: usize) !void {
-        for (0..count) |_| {
+        const n = @min(count, self.max_clusters);
+        for (0..n) |_| {
             const c = try self.allocator.create(Cluster);
             c.* = .{
                 .ref_count = 0,
@@ -76,32 +82,31 @@ pub const ClusterPool = struct {
     }
 
     pub fn acquire(self: *ClusterPool) !*Cluster {
-        self.total_acquires += 1;
-        self.allocated += 1;
-        if (self.allocated > self.peak_allocated) {
-            self.peak_allocated = self.allocated;
-        }
-
-        if (self.free_list) |c| {
-            self.free_list = c.next;
+        const c = if (self.free_list) |fc| reuse: {
+            self.free_list = fc.next;
             if (self.count > 0) self.count -= 1;
-            c.ref_count = 1;
+            fc.ref_count = 1;
             // The pool may have moved since prewarm (Stack.initWithConfig prewarms a
             // local pool, then returns it by value), so the back-pointer stamped at
             // prewarm time can dangle. Re-stamp it with the live address on every
             // acquire or release() pushes onto a phantom free list through dead stack.
-            c.pool = self;
-            return c;
-        }
-
-        stats.global_stats.pool.cluster_fallback.inc();
-        const c = try self.allocator.create(Cluster);
-        c.* = .{
-            .ref_count = 1,
-            .pool = self,
-            .next = null,
-            .data = undefined,
+            fc.pool = self;
+            break :reuse fc;
+        } else fresh: {
+            // Free list empty: a new cluster grows total memory, so enforce the
+            // ceiling. Callers acquire with `try` and drop the packet on error.
+            if (self.allocated >= self.max_clusters) {
+                stats.global_stats.pool.cluster_exhausted.inc();
+                return error.OutOfMemory;
+            }
+            stats.global_stats.pool.cluster_fallback.inc();
+            const nc = try self.allocator.create(Cluster);
+            nc.* = .{ .ref_count = 1, .pool = self, .next = null, .data = undefined };
+            break :fresh nc;
         };
+        self.total_acquires += 1;
+        self.allocated += 1;
+        if (self.allocated > self.peak_allocated) self.peak_allocated = self.allocated;
         return c;
     }
 
@@ -111,6 +116,13 @@ pub const ClusterPool = struct {
 
         self.total_releases += 1;
         if (self.allocated > 0) self.allocated -= 1;
+
+        // Past the idle cap, free the cluster instead of retaining it so a burst
+        // does not leave the free list permanently inflated.
+        if (self.count >= self.max_free) {
+            self.allocator.destroy(cluster);
+            return;
+        }
 
         // Debug poison pattern to catch use-after-free.
         if (std.debug.runtime_safety) {
@@ -148,6 +160,9 @@ pub fn Pool(comptime T: type) type {
         allocator: Allocator,
         free_list: std.ArrayList(*T),
         capacity: usize,
+        // Live objects (acquired and not yet released). capacity is the hard
+        // ceiling on this: once reached, acquire applies backpressure.
+        outstanding: usize = 0,
 
         pub fn init(allocator: Allocator, capacity: usize) Self {
             return .{
@@ -175,13 +190,21 @@ pub fn Pool(comptime T: type) type {
 
         pub fn acquire(self: *Self) !*T {
             if (self.free_list.pop()) |node| {
+                self.outstanding += 1;
                 return node;
             }
+            if (self.outstanding >= self.capacity) {
+                stats.global_stats.pool.generic_exhausted.inc();
+                return error.OutOfMemory;
+            }
             stats.global_stats.pool.generic_fallback.inc();
-            return try self.allocator.create(T);
+            const node = try self.allocator.create(T);
+            self.outstanding += 1;
+            return node;
         }
 
         pub fn release(self: *Self, node: *T) void {
+            if (self.outstanding > 0) self.outstanding -= 1;
             if (self.free_list.items.len >= self.capacity) {
                 self.allocator.destroy(node);
                 return;
@@ -192,6 +215,7 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn tryRelease(self: *Self, node: *T) bool {
+            if (self.outstanding > 0) self.outstanding -= 1;
             if (self.free_list.items.len >= self.capacity) {
                 return false;
             }
@@ -209,6 +233,8 @@ pub const BufferPool = struct {
     buffer_size: usize,
     capacity: usize,
     free_list: std.ArrayList([]u8),
+    // Live buffers (acquired and not yet released); capacity is the hard ceiling.
+    outstanding: usize = 0,
 
     pub fn init(allocator: Allocator, buffer_size: usize, capacity: usize) BufferPool {
         return .{
@@ -237,13 +263,21 @@ pub const BufferPool = struct {
 
     pub fn acquire(self: *BufferPool) ![]u8 {
         if (self.free_list.pop()) |buf| {
+            self.outstanding += 1;
             return buf;
         }
+        if (self.outstanding >= self.capacity) {
+            stats.global_stats.pool.view_exhausted.inc();
+            return error.OutOfMemory;
+        }
         stats.global_stats.pool.buffer_fallback.inc();
-        return try self.allocator.alloc(u8, self.buffer_size);
+        const buf = try self.allocator.alloc(u8, self.buffer_size);
+        self.outstanding += 1;
+        return buf;
     }
 
     pub fn release(self: *BufferPool, buf: []u8) void {
+        if (self.outstanding > 0) self.outstanding -= 1;
         if (self.free_list.items.len >= self.capacity) {
             self.allocator.free(buf);
             return;
@@ -448,8 +482,8 @@ pub const VectorisedView = struct {
     }
 
     pub fn fromSlice(data: []const u8, allocator: Allocator, pool: *ClusterPool) !VectorisedView {
-        // Spans as many clusters as the data needs — a single-cluster copy would
-        // silently truncate anything past ClusterSize (e.g. reassembled datagrams).
+        // Spans as many clusters as the data needs, since a single-cluster copy
+        // would silently truncate anything past ClusterSize (e.g. reassembled datagrams).
         const n_clusters = if (data.len == 0) 1 else (data.len + header.ClusterSize - 1) / header.ClusterSize;
         const views = try allocator.alloc(ClusterView, n_clusters);
         errdefer allocator.free(views);
@@ -723,23 +757,40 @@ test "ClusterPool single-threaded usage" {
     c3.release();
 }
 
-test "BufferPool single-threaded usage" {
+test "BufferPool caps outstanding buffers and applies backpressure" {
     const allocator = std.testing.allocator;
     var pool = BufferPool.init(allocator, 1024, 2);
     defer pool.deinit();
 
     const b1 = try pool.acquire();
     const b2 = try pool.acquire();
-    const b3 = try pool.acquire();
+    // Capacity reached: acquire backpressures instead of allocating without bound.
+    try std.testing.expectError(error.OutOfMemory, pool.acquire());
 
+    pool.release(b1); // frees an outstanding slot
+    const b3 = try pool.acquire(); // reuses it
     try std.testing.expectEqual(@as(usize, 0), pool.free_list.items.len);
 
-    pool.release(b1);
-    try std.testing.expectEqual(@as(usize, 1), pool.free_list.items.len);
-
     pool.release(b2);
+    pool.release(b3);
     try std.testing.expectEqual(@as(usize, 2), pool.free_list.items.len);
+}
 
-    pool.release(b3); // Exceeds capacity, should be freed
-    try std.testing.expectEqual(@as(usize, 2), pool.free_list.items.len);
+test "ClusterPool caps total allocation and idle retention" {
+    const allocator = std.testing.allocator;
+    var pool = ClusterPool.init(allocator);
+    defer pool.deinit();
+    pool.max_clusters = 2;
+    pool.max_free = 1;
+
+    const c1 = try pool.acquire();
+    const c2 = try pool.acquire();
+    // At the cluster ceiling, further allocation is refused (backpressure).
+    try std.testing.expectError(error.OutOfMemory, pool.acquire());
+
+    // Releasing past max_free frees the excess instead of retaining it.
+    c1.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.count);
+    c2.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.count);
 }
