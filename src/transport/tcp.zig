@@ -170,7 +170,7 @@ pub const TCPProtocol = struct {
         self.endpoint_pool.prewarm(1024) catch {};
         self.waiter_queue_pool.prewarm(1024) catch {};
 
-        // prewarm() uses allocator.create(), which leaves fields indeterminate —
+        // prewarm() uses allocator.create(), which leaves fields indeterminate, so
         // default field values don't apply. initialize_v2() and deinit() both read
         // `pooled`, so it must be defined or they act on garbage cc/sack pointers.
         for (self.endpoint_pool.free_list.items) |ep| ep.pooled = false;
@@ -302,6 +302,7 @@ pub const TCPEndpoint = struct {
     rcv_wnd_max: u32 = 64 * 1024 * 1024,
     rcv_buf_used: usize = 0,
     rcv_view_count: usize = 0,
+    ooo_bytes: usize = 0,
     rcv_wnd: u32 = 0,
     snd_wnd: u32 = 65535,
 
@@ -490,6 +491,7 @@ pub const TCPEndpoint = struct {
         self.rcv_wnd_max = 64 * 1024 * 1024;
         self.rcv_buf_used = 0;
         self.rcv_view_count = 0;
+        self.ooo_bytes = 0;
         self.rcv_wnd = self.rcv_wnd_max;
         self.snd_wnd = 65535;
         self.ref_count = 1;
@@ -672,8 +674,7 @@ pub const TCPEndpoint = struct {
             }
         }
 
-        const rcv_used: u32 = @intCast(self.rcv_buf_used);
-        self.rcv_wnd = if (rcv_used < self.rcv_wnd_max) self.rcv_wnd_max - rcv_used else 0;
+        self.recomputeRcvWnd();
         var total_sent: usize = 0;
         var current_view_idx: usize = 0;
         var current_view_offset: usize = 0;
@@ -1282,6 +1283,7 @@ pub const TCPEndpoint = struct {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
+        self.ooo_bytes = 0;
 
         while (self.accepted_queue.popFirst()) |node| {
             node.data.ep.close();
@@ -1364,7 +1366,7 @@ pub const TCPEndpoint = struct {
 
         const old_rcv_wnd = self.rcv_wnd;
         self.rcv_buf_used -= size;
-        self.rcv_wnd = self.rcv_wnd_max - @as(u32, @intCast(self.rcv_buf_used));
+        self.recomputeRcvWnd();
 
         // Send window update if window opened significantly
         if ((old_rcv_wnd == 0) or (self.rcv_wnd -% old_rcv_wnd >= self.rcv_wnd_max / 4)) {
@@ -1417,8 +1419,7 @@ pub const TCPEndpoint = struct {
         }
 
         if (total_moved > 0) {
-            const rcv_used: u32 = @intCast(self.rcv_buf_used);
-            self.rcv_wnd = if (rcv_used < self.rcv_wnd_max) self.rcv_wnd_max - rcv_used else 0;
+            self.recomputeRcvWnd();
             if ((old_rcv_wnd == 0) or (self.rcv_wnd -% old_rcv_wnd >= self.rcv_wnd_max / 4)) {
                 self.sendControl(header.TCPFlagAck) catch {};
             }
@@ -1622,8 +1623,7 @@ pub const TCPEndpoint = struct {
         const tcp_hdr = pre.prepend(header.TCPMinimumSize).?;
         @memset(tcp_hdr, 0);
         var h = header.TCP.init(tcp_hdr);
-        const rcv_used: u32 = @intCast(self.rcv_buf_used);
-        self.rcv_wnd = if (rcv_used < self.rcv_wnd_max) self.rcv_wnd_max - rcv_used else 0;
+        self.recomputeRcvWnd();
         h.encode(la.port, ra.port, self.snd_nxt, self.rcv_nxt, flags, @as(u16, @intCast(@min(self.rcv_wnd >> @as(u5, @intCast(self.rcv_wnd_scale)), 65535))));
         h.setChecksum(h.calculateChecksum(la.addr.v4, ra.addr.v4, &[_]u8{}));
         const pb = tcpip.PacketBuffer{ .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 }, .header = pre };
@@ -1652,8 +1652,7 @@ pub const TCPEndpoint = struct {
         const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
         @memset(tcp_hdr, 0);
         var reply_h = header.TCP.init(tcp_hdr);
-        const rcv_used: u32 = @intCast(self.rcv_buf_used);
-        self.rcv_wnd = if (rcv_used < self.rcv_wnd_max) self.rcv_wnd_max - rcv_used else 0;
+        self.recomputeRcvWnd();
         reply_h.encode(id.local_port, id.remote_port, entry.snd_nxt, entry.rcv_nxt, header.TCPFlagSyn | header.TCPFlagAck, @as(u16, @intCast(@min(self.rcv_wnd >> @as(u5, @intCast(self.rcv_wnd_scale)), 65535))));
         reply_h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
         var opt_ptr = reply_h.data[20..];
@@ -2141,7 +2140,7 @@ pub const TCPEndpoint = struct {
                 }
             },
             .time_wait => {
-                // RFC 793: our final ACK was lost — re-ACK the retransmitted
+                // RFC 793: our final ACK was lost, so re-ACK the retransmitted
                 // FIN and restart the 2MSL timer.
                 if (fl & header.TCPFlagFin != 0) {
                     self.sendControl(header.TCPFlagAck) catch {};
@@ -2169,6 +2168,14 @@ pub const TCPEndpoint = struct {
         _ = now;
     }
 
+    // Advertised window counts both delivered (in-order) and buffered
+    // out-of-order bytes against rcv_wnd_max, so OOO data shrinks the window.
+    pub fn recomputeRcvWnd(self: *TCPEndpoint) void {
+        const max: usize = self.rcv_wnd_max;
+        const used = self.rcv_buf_used + self.ooo_bytes;
+        self.rcv_wnd = if (used < max) @intCast(max - used) else 0;
+    }
+
     /// Insert out-of-order segment for later processing.
     pub fn insertOOO(self: *TCPEndpoint, seq: u32, pkt_data: buffer.VectorisedView) !void {
         var it = self.ooo_list.first;
@@ -2177,6 +2184,13 @@ pub const TCPEndpoint = struct {
             if (seqBefore(seq, node.data.seq)) break;
             it = node.next;
         }
+        // OOO bytes count against the receive window like in-order data, so a
+        // peer withholding rcv_nxt cannot buffer past the window. Over-budget
+        // segments are dropped and recovered by retransmission once the gap fills.
+        if (self.rcv_buf_used + self.ooo_bytes + pkt_data.size > self.rcv_wnd_max) {
+            stats.global_stats.tcp.ooo_dropped.inc();
+            return error.NoBufferSpace;
+        }
         const node = try self.proto.packet_node_pool.acquire();
         node.data = .{ .data = try pkt_data.cloneInPool(&self.proto.view_pool), .seq = seq };
         if (it) |next| {
@@ -2184,6 +2198,7 @@ pub const TCPEndpoint = struct {
         } else {
             self.ooo_list.append(node);
         }
+        self.ooo_bytes += pkt_data.size;
         try self.updateSackBlocks(seq, seq +% @as(u32, @intCast(pkt_data.size)));
     }
 
@@ -2193,11 +2208,13 @@ pub const TCPEndpoint = struct {
             if (node.data.seq == self.rcv_nxt) {
                 _ = self.ooo_list.remove(node);
                 self.rcv_list.append(node);
+                self.ooo_bytes -= node.data.data.size;
                 self.rcv_buf_used += node.data.data.size;
                 self.rcv_view_count += node.data.data.views.len;
                 self.rcv_nxt +%= @as(u32, @intCast(node.data.data.size));
             } else if (seqBefore(node.data.seq, self.rcv_nxt)) {
                 _ = self.ooo_list.remove(node);
+                self.ooo_bytes -= node.data.data.size;
                 node.data.data.deinit();
                 self.proto.packet_node_pool.release(node);
             } else break;

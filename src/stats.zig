@@ -174,6 +174,7 @@ pub const TCPStats = struct {
     syncache_dropped: Counter = .{},
     syncache_searches: Counter = .{},
     syncache_max_size: Counter = .{},
+    ooo_dropped: Counter = .{},
 
     // TCP flags stats.
     rx_syn: Counter = .{},
@@ -222,6 +223,7 @@ pub const TCPStats = struct {
         self.syncache_dropped.store(0);
         self.syncache_searches.store(0);
         self.syncache_max_size.store(0);
+        self.ooo_dropped.store(0);
         self.rx_syn.store(0);
         self.rx_syn_ack.store(0);
         self.rx_ack.store(0);
