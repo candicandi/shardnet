@@ -457,7 +457,7 @@ pub const Resolver = struct {
         // Header
         @memset(dns_buf[0..header.DNSHeaderSize], 0);
         var h = header.DNS.init(dns_buf[0..header.DNSHeaderSize]);
-        const query_id: u16 = @intCast(std.time.milliTimestamp() & 0xFFFF);
+        const query_id: u16 = std.crypto.random.int(u16);
         h.setId(query_id);
         h.setFlags(0x0100); // Standard Query, Recursion Desired
         h.setQuestionCount(1);
