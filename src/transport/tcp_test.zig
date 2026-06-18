@@ -531,6 +531,100 @@ test "TCP out-of-order queue is bounded by the receive window" {
     try std.testing.expectEqual(@as(usize, 100), ep.rcv_buf_used);
 }
 
+test "Stack caps the number of live transport endpoints" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.initWithConfig(allocator, .{ .max_endpoints = 3 });
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var wqs: [4]waiter.Queue = .{ .{}, .{}, .{}, .{} };
+    var eps: [4]*TCPEndpoint = undefined;
+    for (0..4) |i| {
+        const r = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wqs[i]);
+        eps[i] = @ptrCast(@alignCast(r.ptr));
+    }
+    defer for (eps) |ep| ep.close();
+
+    // Three binds fill the cap (distinct ports give distinct ids).
+    try eps[0].endpoint().bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 1001 });
+    try eps[1].endpoint().bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 1002 });
+    try eps[2].endpoint().bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 1003 });
+
+    const drops_before = shardnet.stats.global_stats.tcp.endpoints_dropped.load();
+    try std.testing.expectError(tcpip.Error.OutOfMemory, eps[3].endpoint().bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 1004 }));
+    try std.testing.expectEqual(drops_before + 1, shardnet.stats.global_stats.tcp.endpoints_dropped.load());
+}
+
+test "passive open past the endpoint cap is rejected without leaking" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    // Cap of 2 leaves room for the listener and the client, but not the
+    // accepted endpoint the completing ACK would create.
+    var s = try stack.Stack.initWithConfig(allocator, .{ .max_endpoints = 2 });
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_ep = MockLinkEndpoint{ .allocator = allocator };
+    defer fake_ep.deinit();
+    try s.createNIC(1, fake_ep.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const client_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const server_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = client_addr.addr, .prefix_len = 24 } });
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = server_addr.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(server_addr.addr, .{ .addr = [_]u8{0} ** 6 });
+    try s.addLinkAddress(client_addr.addr, .{ .addr = [_]u8{0} ** 6 });
+
+    var wq_server = waiter.Queue{};
+    const ep_server: *TCPEndpoint = @ptrCast(@alignCast((try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_server)).ptr));
+    defer ep_server.close();
+    try ep_server.endpoint().bind(server_addr);
+    try ep_server.endpoint().listen(10);
+
+    var wq_client = waiter.Queue{};
+    const ep_client: *TCPEndpoint = @ptrCast(@alignCast((try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client)).ptr));
+    defer ep_client.close();
+    try ep_client.endpoint().bind(client_addr);
+    try ep_client.endpoint().connect(server_addr);
+
+    const r_to_server = stack.Route{ .local_address = server_addr.addr, .remote_address = client_addr.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
+    const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = server_addr.addr, .remote_port = 1234, .remote_address = client_addr.addr };
+    const r_to_client = stack.Route{ .local_address = client_addr.addr, .remote_address = server_addr.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
+    const id_to_client = stack.TransportEndpointID{ .local_port = 1234, .local_address = client_addr.addr, .remote_port = 80, .remote_address = server_addr.addr };
+
+    // SYN -> server: creates a syncache entry and emits SYN-ACK, no table growth.
+    {
+        var p = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+        defer p.data.deinit();
+        ep_server.handlePacket(&r_to_server, id_to_server, p);
+    }
+    // SYN-ACK -> client: client becomes established and emits the completing ACK.
+    {
+        var p = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+        defer p.data.deinit();
+        ep_client.handlePacket(&r_to_client, id_to_client, p);
+    }
+    try std.testing.expectEqual(tcp.EndpointState.established, ep_client.state);
+
+    // Completing ACK -> server: the accepted endpoint would be the third, which
+    // exceeds the cap, so registration is rejected, the half-built endpoint is
+    // released, and nothing reaches the accept queue.
+    const drops_before = shardnet.stats.global_stats.tcp.endpoints_dropped.load();
+    {
+        var p = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+        defer p.data.deinit();
+        ep_server.handlePacket(&r_to_server, id_to_server, p);
+    }
+    try std.testing.expectEqual(drops_before + 1, shardnet.stats.global_stats.tcp.endpoints_dropped.load());
+    try std.testing.expect(ep_server.accepted_queue.first == null);
+}
+
 test "TCP window scaling negotiation" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
