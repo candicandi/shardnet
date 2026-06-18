@@ -26,12 +26,16 @@ const stats = @import("../stats.zig");
 
 const congestion = @import("congestion/control.zig");
 const RateLimiter = @import("../ratelimit.zig").RateLimiter;
+const PerSourceRateLimiter = @import("../ratelimit.zig").PerSourceRateLimiter;
 
 pub const ProtocolNumber = 6;
 
 // Global token bucket bounding the rate of passive-open SYN processing (and thus
 // SYN-ACK emission) under a flood. Generous defaults; tunable at runtime.
 pub var syn_limiter: RateLimiter = .{ .max_tokens = 1024, .tokens = 1024, .refill_rate = 1024 };
+// Per-source SYN cap so a single source cannot drain the global budget above.
+// Generous by default (NAT/proxy sources share a bucket); tunable at runtime.
+pub var syn_source_limiter: PerSourceRateLimiter(4096) = .{ .per_source_tokens = 256, .per_source_rate = 256 };
 // RFC 5961 Section 10: challenge ACKs must be rate-limited or they become a
 // reflection/amplification vector (an in-window RST flood elicits one ACK each).
 pub var challenge_ack_limiter: RateLimiter = .{};
@@ -1877,7 +1881,9 @@ pub const TCPEndpoint = struct {
                     }
                     // Bound the SYN-ACK emission rate so a flood cannot make us
                     // respond without limit; supplements the per-listener backlog.
-                    if (!syn_limiter.tryConsume()) {
+                    // The per-source gate stops one source from draining the
+                    // global budget; the global gate caps the aggregate rate.
+                    if (!syn_source_limiter.tryConsume(id.remote_address) or !syn_limiter.tryConsume()) {
                         stats.global_stats.tcp.syn_throttled.inc();
                         return;
                     }

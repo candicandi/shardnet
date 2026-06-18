@@ -685,6 +685,9 @@ test "TCP SYN processing is rate limited" {
     const saved = tcp.syn_limiter;
     defer tcp.syn_limiter = saved;
     tcp.syn_limiter = .{ .max_tokens = 2, .tokens = 2, .refill_rate = 2 };
+    // Clear the per-source gate so this test exercises only the global limit
+    // (all three SYNs share one source address, well under the per-source cap).
+    tcp.syn_source_limiter = .{ .per_source_tokens = 256, .per_source_rate = 256 };
 
     const r_to_server = stack.Route{
         .local_address = server_addr.addr,
@@ -697,6 +700,74 @@ test "TCP SYN processing is rate limited" {
 
     // Three SYNs from distinct source ports: the budget admits two (recorded in the
     // syncache), the third is rate-limited and dropped before any SYN-ACK.
+    for ([_]u16{ 1234, 1235, 1236 }) |sport| {
+        const syn_buf = try allocator.alloc(u8, header.TCPMinimumSize);
+        defer allocator.free(syn_buf);
+        @memset(syn_buf, 0);
+        var syn = header.TCP.init(syn_buf);
+        syn.encode(sport, server_addr.port, 1000, 0, header.TCPFlagSyn, 65535);
+        var pkt = tcpip.PacketBuffer{
+            .data = try buffer.VectorisedView.fromSlice(syn_buf, allocator, &s.cluster_pool),
+            .header = buffer.Prependable.init(&[_]u8{}),
+        };
+        defer pkt.data.deinit();
+        const id = stack.TransportEndpointID{
+            .local_port = 80,
+            .local_address = server_addr.addr,
+            .remote_port = sport,
+            .remote_address = client_addr.addr,
+        };
+        ep_server.handlePacket(&r_to_server, id, pkt);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), ep_server.syncache.count());
+    try std.testing.expectEqual(base_throttled + 1, shardnet.stats.global_stats.tcp.syn_throttled.load());
+}
+
+test "TCP per-source SYN limit throttles one source under a healthy global budget" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_ep = MockLinkEndpoint{ .allocator = allocator };
+    defer fake_ep.deinit();
+    try s.createNIC(1, fake_ep.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const client_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const server_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = server_addr.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(client_addr.addr, .{ .addr = [_]u8{0} ** 6 });
+
+    var wq_server = waiter.Queue{};
+    const ep_server: *TCPEndpoint = @ptrCast(@alignCast((try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_server)).ptr));
+    defer ep_server.close();
+    try ep_server.endpoint().bind(server_addr);
+    try ep_server.endpoint().listen(10);
+
+    // Global budget plentiful; the cap must come from the per-source gate.
+    const saved = tcp.syn_limiter;
+    const saved_src = tcp.syn_source_limiter;
+    defer tcp.syn_limiter = saved;
+    defer tcp.syn_source_limiter = saved_src;
+    tcp.syn_limiter = .{ .max_tokens = 1024, .tokens = 1024, .refill_rate = 1024 };
+    tcp.syn_source_limiter = .{ .per_source_tokens = 2, .per_source_rate = 2 };
+
+    const r_to_server = stack.Route{
+        .local_address = server_addr.addr,
+        .remote_address = client_addr.addr,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+    const base_throttled = shardnet.stats.global_stats.tcp.syn_throttled.load();
+
+    // Three SYNs from the same source: the per-source budget admits two, the
+    // third is throttled even though the global budget is untouched.
     for ([_]u16{ 1234, 1235, 1236 }) |sport| {
         const syn_buf = try allocator.alloc(u8, header.TCPMinimumSize);
         defer allocator.free(syn_buf);
