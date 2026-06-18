@@ -310,6 +310,7 @@ pub const ARPEndpoint = struct {
     nic: *stack.NIC,
     pending_requests: std.HashMap(tcpip.Address, i64, stack.Stack.AddressContext, 80),
     timer: time.Timer = undefined,
+    reply_limiter: RateLimiter = .{},
 
     pub fn networkEndpoint(self: *ARPEndpoint) stack.NetworkEndpoint {
         return .{
@@ -492,6 +493,13 @@ pub const ARPEndpoint = struct {
         if (h.op() == 1) { // Request
             stats.global_stats.arp.rx_requests.inc();
             if (self.nic.hasAddress(target_proto_addr)) {
+                // Bound reply emission so a request flood for our address cannot make
+                // us answer without limit; the budget is generous so real resolution
+                // is unaffected.
+                if (!self.reply_limiter.tryConsume()) {
+                    stats.global_stats.arp.replies_throttled.inc();
+                    return;
+                }
                 const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
 
