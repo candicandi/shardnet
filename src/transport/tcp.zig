@@ -25,8 +25,13 @@ const time = @import("../time.zig");
 const stats = @import("../stats.zig");
 
 const congestion = @import("congestion/control.zig");
+const RateLimiter = @import("../ratelimit.zig").RateLimiter;
 
 pub const ProtocolNumber = 6;
+
+// Global token bucket bounding the rate of passive-open SYN processing (and thus
+// SYN-ACK emission) under a flood. Generous defaults; tunable at runtime.
+pub var syn_limiter: RateLimiter = .{ .max_tokens = 1024, .tokens = 1024, .refill_rate = 1024 };
 
 /// TCP connection states per RFC 793 Section 3.2.
 /// State diagram: CLOSED -> (active open) SYN_SENT -> ESTABLISHED
@@ -1838,6 +1843,12 @@ pub const TCPEndpoint = struct {
                     if (self.syncache.count() + self.accepted_queue.len >= self.backlog) {
                         log.warn("Listen queue full: syncache={} accepted={} backlog={}", .{ self.syncache.count(), self.accepted_queue.len, self.backlog });
                         stats.global_stats.tcp.syncache_dropped.inc();
+                        return;
+                    }
+                    // Bound the SYN-ACK emission rate so a flood cannot make us
+                    // respond without limit; supplements the per-listener backlog.
+                    if (!syn_limiter.tryConsume()) {
+                        stats.global_stats.tcp.syn_throttled.inc();
                         return;
                     }
                     const sync_key = SyncacheKey{ .addr = id.remote_address, .port = h.sourcePort() };
