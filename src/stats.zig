@@ -73,6 +73,16 @@ pub const Snapshot = struct {
     arp: ARPStatsSnapshot,
     link: LinkStatsSnapshot,
     direction: DirectionStatsSnapshot,
+    pool: PoolStatsSnapshot,
+};
+
+pub const PoolStatsSnapshot = struct {
+    cluster_fallback: u64,
+    buffer_fallback: u64,
+    generic_fallback: u64,
+    cluster_exhausted: u64,
+    view_exhausted: u64,
+    generic_exhausted: u64,
 };
 
 pub const DirectionStatsSnapshot = struct {
@@ -306,6 +316,17 @@ pub const PoolStats = struct {
         self.view_exhausted.store(0);
         self.generic_exhausted.store(0);
     }
+
+    pub fn snapshot(self: *const PoolStats) PoolStatsSnapshot {
+        return .{
+            .cluster_fallback = self.cluster_fallback.load(),
+            .buffer_fallback = self.buffer_fallback.load(),
+            .generic_fallback = self.generic_fallback.load(),
+            .cluster_exhausted = self.cluster_exhausted.load(),
+            .view_exhausted = self.view_exhausted.load(),
+            .generic_exhausted = self.generic_exhausted.load(),
+        };
+    }
 };
 
 pub const ICMPStats = struct {
@@ -316,6 +337,7 @@ pub const ICMPStats = struct {
     tx_dest_unreachable: Counter = .{},
     tx_time_exceeded: Counter = .{},
     echo_replies_throttled: Counter = .{},
+    errors_throttled: Counter = .{},
 };
 
 pub const ICMPv6Stats = struct {
@@ -327,6 +349,7 @@ pub const ICMPv6Stats = struct {
     rx_neighbor_advertisements: Counter = .{},
     rx_router_solicitations: Counter = .{},
     rx_router_advertisements: Counter = .{},
+    router_advertisements_ignored: Counter = .{},
     tx_neighbor_advertisements: Counter = .{},
     echo_replies_throttled: Counter = .{},
 };
@@ -464,6 +487,7 @@ pub const StackStats = struct {
                 .rx_drops = self.direction.rx_drops.load(),
                 .tx_drops = self.direction.tx_drops.load(),
             },
+            .pool = self.pool.snapshot(),
         };
     }
 
@@ -533,6 +557,15 @@ pub const StackStats = struct {
         try writer.print("net_tx_packets_total{{iface=\"{s}\"}} {d}\n", .{ label, s.direction.tx_packets });
         try writer.print("net_rx_drops_total{{iface=\"{s}\"}} {d}\n", .{ label, s.direction.rx_drops });
         try writer.print("net_tx_drops_total{{iface=\"{s}\"}} {d}\n", .{ label, s.direction.tx_drops });
+
+        // Pool backpressure metrics: *_exhausted counters rising signals an
+        // operator that a resource cap is being hit (likely a DoS or misconfig).
+        try writer.print("net_pool_cluster_fallback_total{{iface=\"{s}\"}} {d}\n", .{ label, s.pool.cluster_fallback });
+        try writer.print("net_pool_buffer_fallback_total{{iface=\"{s}\"}} {d}\n", .{ label, s.pool.buffer_fallback });
+        try writer.print("net_pool_generic_fallback_total{{iface=\"{s}\"}} {d}\n", .{ label, s.pool.generic_fallback });
+        try writer.print("net_pool_cluster_exhausted_total{{iface=\"{s}\"}} {d}\n", .{ label, s.pool.cluster_exhausted });
+        try writer.print("net_pool_view_exhausted_total{{iface=\"{s}\"}} {d}\n", .{ label, s.pool.view_exhausted });
+        try writer.print("net_pool_generic_exhausted_total{{iface=\"{s}\"}} {d}\n", .{ label, s.pool.generic_exhausted });
     }
 };
 
