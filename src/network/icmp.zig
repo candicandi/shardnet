@@ -277,6 +277,7 @@ pub const ICMPv4PacketHandler = struct {
     pub fn sendDestUnreachable(s: *stack.Stack, r: *const stack.Route, code: u8, original_pkt: []const u8) void {
         if (!rate_limiter.tryConsume()) {
             log.debug("ICMP rate limited", .{});
+            stats.global_stats.icmp.errors_throttled.inc();
             return;
         }
 
@@ -320,6 +321,7 @@ pub const ICMPv4PacketHandler = struct {
     /// Send Time Exceeded message.
     pub fn sendTimeExceeded(s: *stack.Stack, r: *const stack.Route, code: u8, original_pkt: []const u8) void {
         if (!rate_limiter.tryConsume()) {
+            stats.global_stats.icmp.errors_throttled.inc();
             return;
         }
 
@@ -523,6 +525,32 @@ test "ICMP fragmentation needed updates the PMTU cache" {
     std.mem.writeInt(u16, msg[6..8], 600, .big);
     feed(&s, &r, &msg);
     try std.testing.expectEqual(@as(?u32, 1400), s.pmtuFor(path_dst));
+}
+
+test "ICMPv4 error senders count throttle drops" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    // Drain the shared error limiter so both senders take the throttle path;
+    // save/restore it so test ordering does not matter.
+    const saved = ICMPv4PacketHandler.rate_limiter;
+    defer ICMPv4PacketHandler.rate_limiter = saved;
+    ICMPv4PacketHandler.rate_limiter.tokens = 0;
+
+    var r = stack.Route{
+        .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .remote_address = .{ .v4 = .{ 10, 0, 0, 2 } },
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = undefined,
+    };
+    const orig = [_]u8{0} ** 28;
+
+    const before = stats.global_stats.icmp.errors_throttled.load();
+    ICMPv4PacketHandler.sendDestUnreachable(&s, &r, 0, &orig);
+    ICMPv4PacketHandler.sendTimeExceeded(&s, &r, 0, &orig);
+    try std.testing.expectEqual(before + 2, stats.global_stats.icmp.errors_throttled.load());
 }
 
 test "RTT measurement" {
