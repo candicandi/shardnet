@@ -87,6 +87,42 @@ pub const UDPProtocol = struct {
     }
 };
 
+// Verify a received UDP datagram's checksum. RFC 768: a zero checksum means the
+// sender computed none (IPv4 only), so accept it. `segment` is the whole datagram
+// (header + payload) as received; the pseudo-header uses the packet's addresses.
+fn verifyUdpChecksum(h: header.UDP, src: tcpip.Address, dst: tcpip.Address, segment: buffer.VectorisedView) bool {
+    if (h.checksum() == 0) return true;
+    var sum: u32 = 0;
+    switch (src) {
+        .v4 => |s| {
+            const d = dst.v4;
+            sum += std.mem.readInt(u16, s[0..2], .big);
+            sum += std.mem.readInt(u16, s[2..4], .big);
+            sum += std.mem.readInt(u16, d[0..2], .big);
+            sum += std.mem.readInt(u16, d[2..4], .big);
+            sum += 17;
+            sum += h.length();
+        },
+        .v6 => |s| {
+            const d = dst.v6;
+            for (0..8) |i| {
+                sum += std.mem.readInt(u16, s[i * 2 ..][0..2], .big);
+                sum += std.mem.readInt(u16, d[i * 2 ..][0..2], .big);
+            }
+            sum += @as(u32, h.length());
+            sum += 17;
+        },
+    }
+    var remaining: usize = h.length();
+    for (segment.views) |v| {
+        const n = @min(remaining, v.view.len);
+        sum = header.internetChecksum(v.view[0..n], sum);
+        remaining -= n;
+        if (remaining == 0) break;
+    }
+    return header.finishChecksum(sum) == 0;
+}
+
 pub const UDPEndpoint = struct {
     pub const Packet = struct {
         data: buffer.VectorisedView,
@@ -310,6 +346,16 @@ pub const UDPEndpoint = struct {
         var mut_pkt = pkt;
 
         const h = header.UDP.init(mut_pkt.data.first() orelse return);
+
+        // Drop datagrams whose non-zero checksum fails to verify (silent corruption
+        // otherwise reaches the app). UDP-Lite partial coverage is not verified here.
+        if (self.options.checksum_coverage == 0 and
+            !verifyUdpChecksum(h, r.remote_address, r.local_address, mut_pkt.data))
+        {
+            stats.global_stats.udp.checksum_errors.inc();
+            return;
+        }
+
         mut_pkt.data.trimFront(header.UDPMinimumSize);
 
         stats.global_stats.udp.rx_packets.inc();
@@ -569,6 +615,26 @@ pub const UDPEndpoint = struct {
         return self.remote_addr orelse tcpip.Error.InvalidEndpointState;
     }
 };
+
+test "UDP checksum verification accepts a valid datagram and rejects a corrupt one" {
+    var seg = [_]u8{0} ** 12;
+    var h = header.UDP.init(seg[0..8]);
+    h.setSourcePort(1234);
+    h.setDestinationPort(5678);
+    h.setLength(12);
+    @memcpy(seg[8..12], "ping");
+    const src = [4]u8{ 10, 0, 0, 1 };
+    const dst = [4]u8{ 10, 0, 0, 2 };
+    h.setChecksum(0);
+    h.setChecksum(h.calculateChecksum(src, dst, seg[8..12]));
+
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = &seg }};
+    const vv = buffer.VectorisedView.init(seg.len, &views);
+    try std.testing.expect(verifyUdpChecksum(h, .{ .v4 = src }, .{ .v4 = dst }, vv));
+
+    seg[9] ^= 0xff;
+    try std.testing.expect(!verifyUdpChecksum(h, .{ .v4 = src }, .{ .v4 = dst }, vv));
+}
 
 test "UDP parsePorts rejects a segment too short to hold both ports" {
     var bytes = [_]u8{ 0x12, 0x34, 0x56 };
