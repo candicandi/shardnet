@@ -202,4 +202,16 @@ pub fn build(b: *std.Build) void {
     });
     interop_exe.root_module.addImport("shardnet", shardnet_mod);
     interop_step.dependOn(&b.addInstallArtifact(interop_exe, .{}).step);
+
+    // -- Soak step -----------------------------------------------------------
+    // In-process loopback soak / load harness for leak and stability testing.
+    const soak_step = b.step("soak", "Build the loopback soak/load harness");
+    const soak_exe = b.addExecutable(.{
+        .name = "soak",
+        .root_source_file = b.path("examples/soak.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    soak_exe.root_module.addImport("shardnet", shardnet_mod);
+    soak_step.dependOn(&b.addInstallArtifact(soak_exe, .{}).step);
 }
