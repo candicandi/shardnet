@@ -35,3 +35,18 @@ jobs:
         run: zig build -Dtarget=aarch64-macos
       - name: Build for x86_64-macos
         run: zig build -Dtarget=x86_64-macos
+
+  interop:
+    name: Live TAP interop vs the kernel (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+      - name: Install interop peers (nc, dnsmasq, ping)
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd dnsmasq-base iputils-ping
+      - name: Build interop binary
+        run: zig build interop
+      - name: Run live interop scenarios (ping, TCP, HTTP, outbound, DHCP)
+        run: sudo bash scripts/interop_smoke.sh "$PWD/zig-out/bin/interop_tap"
