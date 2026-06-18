@@ -105,6 +105,11 @@ pub const TCPStatsSnapshot = struct {
     resets_sent: u64,
     resets_received: u64,
     active_endpoints: u64,
+    syncache_dropped: u64,
+    ooo_dropped: u64,
+    endpoints_dropped: u64,
+    syn_throttled: u64,
+    challenge_acks_throttled: u64,
 };
 
 pub const ARPStatsSnapshot = struct {
@@ -115,6 +120,7 @@ pub const ARPStatsSnapshot = struct {
     cache_evictions: u64,
     pending_drops: u64,
     requests_throttled: u64,
+    replies_throttled: u64,
 };
 
 pub const LinkStatsSnapshot = struct {
@@ -178,6 +184,7 @@ pub const TCPStats = struct {
     ooo_dropped: Counter = .{},
     endpoints_dropped: Counter = .{},
     syn_throttled: Counter = .{},
+    challenge_acks_throttled: Counter = .{},
 
     // TCP flags stats.
     rx_syn: Counter = .{},
@@ -208,6 +215,11 @@ pub const TCPStats = struct {
             .resets_sent = self.resets_sent.load(),
             .resets_received = self.resets_received.load(),
             .active_endpoints = self.active_endpoints.load(),
+            .syncache_dropped = self.syncache_dropped.load(),
+            .ooo_dropped = self.ooo_dropped.load(),
+            .endpoints_dropped = self.endpoints_dropped.load(),
+            .syn_throttled = self.syn_throttled.load(),
+            .challenge_acks_throttled = self.challenge_acks_throttled.load(),
         };
     }
 
@@ -229,6 +241,7 @@ pub const TCPStats = struct {
         self.ooo_dropped.store(0);
         self.endpoints_dropped.store(0);
         self.syn_throttled.store(0);
+        self.challenge_acks_throttled.store(0);
         self.rx_syn.store(0);
         self.rx_syn_ack.store(0);
         self.rx_ack.store(0);
@@ -250,6 +263,7 @@ pub const ARPStats = struct {
     cache_evictions: Counter = .{},
     pending_drops: Counter = .{},
     requests_throttled: Counter = .{},
+    replies_throttled: Counter = .{},
 
     pub fn snapshot(self: *const ARPStats) ARPStatsSnapshot {
         return .{
@@ -260,6 +274,7 @@ pub const ARPStats = struct {
             .cache_evictions = self.cache_evictions.load(),
             .pending_drops = self.pending_drops.load(),
             .requests_throttled = self.requests_throttled.load(),
+            .replies_throttled = self.replies_throttled.load(),
         };
     }
 
@@ -271,6 +286,7 @@ pub const ARPStats = struct {
         self.cache_evictions.store(0);
         self.pending_drops.store(0);
         self.requests_throttled.store(0);
+        self.replies_throttled.store(0);
     }
 };
 
@@ -299,6 +315,7 @@ pub const ICMPStats = struct {
     tx_echo_replies: Counter = .{},
     tx_dest_unreachable: Counter = .{},
     tx_time_exceeded: Counter = .{},
+    echo_replies_throttled: Counter = .{},
 };
 
 pub const ICMPv6Stats = struct {
@@ -319,6 +336,7 @@ pub const UDPStats = struct {
     tx_packets: Counter = .{},
     rx_bytes: Counter = .{},
     tx_bytes: Counter = .{},
+    checksum_errors: Counter = .{},
 };
 
 pub const LinkStats = struct {
