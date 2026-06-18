@@ -616,7 +616,12 @@ pub const TCPEndpoint = struct {
 
     fn ready_external(ptr: *anyopaque, mask: waiter.EventMask) bool {
         const self: *TCPEndpoint = @ptrCast(@alignCast(ptr));
-        return (self.waiter_queue.events() & mask) != 0;
+        var ev = self.waiter_queue.events();
+        // EventOut doubles as the internal "ARP resolved, retry TX" wake (stack.zig).
+        // A connecting endpoint must not report writable until it can accept writes,
+        // or a poller treats the active open as complete before the handshake is.
+        if (self.state != .established and self.state != .close_wait) ev &= ~waiter.EventOut;
+        return (ev & mask) != 0;
     }
 
     fn writeView_external(ptr: *anyopaque, view: buffer.VectorisedView, opts: tcpip.WriteOptions) tcpip.Error!usize {
