@@ -128,6 +128,60 @@ test "TCP 2MSL TIME_WAIT expiration" {
     try std.testing.expect(s.endpoints.get(id) == null);
 }
 
+test "TCP CLOSING is reclaimed by the 2MSL backstop (no FIN-wait leak)" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    s.tcp_msl = 100;
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_link = NullLinkEndpoint{};
+    try s.createNIC(1, fake_link.linkEndpoint());
+    const nic = s.nics.get(1).?;
+
+    const client_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const server_addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+
+    var wq = waiter.Queue{};
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep: *TCPEndpoint = @ptrCast(@alignCast(ep_res.ptr));
+    defer ep.close();
+
+    // FIN_WAIT_1 (our FIN at seq 999 is outstanding). A peer FIN that does NOT ack
+    // our FIN drives a simultaneous close into CLOSING.
+    ep.state = .fin_wait1;
+    ep.local_addr = client_addr;
+    ep.remote_addr = server_addr;
+    ep.snd_nxt = 1000;
+    ep.rcv_nxt = 5001;
+    const id = stack.TransportEndpointID{ .local_port = client_addr.port, .local_address = client_addr.addr, .remote_port = server_addr.port, .remote_address = server_addr.addr };
+    try s.registerTransportEndpoint(id, ep.transportEndpoint());
+
+    const fin_buf = try allocator.alloc(u8, header.TCPMinimumSize);
+    defer allocator.free(fin_buf);
+    @memset(fin_buf, 0);
+    var fin = header.TCP.init(fin_buf);
+    fin.encode(server_addr.port, client_addr.port, 5001, ep.snd_nxt -% 1, header.TCPFlagFin | header.TCPFlagAck, 65535);
+
+    const r = stack.Route{ .local_address = client_addr.addr, .remote_address = server_addr.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
+    var fin_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fin_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    defer fin_pkt.data.deinit();
+    ep.handlePacket(&r, id, fin_pkt);
+
+    // Entered CLOSING and armed the 2MSL backstop (pre-fix it armed nothing -> leak).
+    try std.testing.expectEqual(EndpointState.closing, ep.state);
+    try std.testing.expect(ep.time_wait_timer.active);
+    if (s.endpoints.get(id)) |e| e.decRef();
+
+    // After 2MSL the stuck CLOSING endpoint is reclaimed, not leaked forever.
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 201);
+    try std.testing.expectEqual(EndpointState.closed, ep.state);
+    try std.testing.expect(s.endpoints.get(id) == null);
+}
+
 test "TCP RFC 1337 RST in TIME_WAIT ignored" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
