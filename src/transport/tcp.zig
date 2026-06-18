@@ -918,6 +918,7 @@ pub const TCPEndpoint = struct {
         var r = self.cached_route.?;
 
         const hdr_buf = self.proto.header_pool.acquire() catch return tcpip.Error.OutOfMemory;
+        defer self.proto.header_pool.release(hdr_buf);
         var pre = buffer.Prependable.init(hdr_buf);
         const tcp_hdr = pre.prepend(header.TCPMinimumSize).?;
         @memset(tcp_hdr, 0);
@@ -2341,6 +2342,72 @@ test "notify after app close skips a socket-owned (freed) waiter queue" {
     ep.owns_waiter_queue = true;
     ep.notify(waiter.EventErr | waiter.EventHUp);
     try std.testing.expect(sentinel.ready_mask != 0);
+}
+
+test "keepalive probe releases its pooled header buffer" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return 0;
+        }
+    }{};
+    const link_ep = stack.LinkEndpoint{
+        .ptr = &fake_link,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_link).writePacket,
+            .writePackets = null,
+            .attach = @TypeOf(fake_link).attach,
+            .linkAddress = @TypeOf(fake_link).linkAddress,
+            .mtu = @TypeOf(fake_link).mtu,
+            .setMTU = @TypeOf(fake_link).setMTU,
+            .capabilities = @TypeOf(fake_link).capabilities,
+        },
+    };
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = .{ 10, 0, 0, 1 } }, .prefix_len = 24 } });
+
+    var wq = waiter.Queue{};
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep: *TCPEndpoint = @ptrCast(@alignCast(ep_res.ptr));
+    defer ep.close();
+
+    ep.state = .established;
+    ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
+    ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
+    ep.snd_una = 1000;
+    ep.rcv_nxt = 5000;
+    // A fully resolved route so the probe transmits through the link (no WouldBlock).
+    ep.cached_route = .{
+        .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
+        .remote_address = .{ .v4 = .{ 10, 0, 0, 2 } },
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .remote_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+
+    const before = tcp_proto.header_pool.outstanding;
+    try ep.sendKeepaliveProbe();
+    try std.testing.expectEqual(before, tcp_proto.header_pool.outstanding);
 }
 
 test "NewReno slow start" {
