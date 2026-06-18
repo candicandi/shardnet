@@ -280,6 +280,7 @@ pub const TCPProtocol = struct {
     fn parsePorts(ptr: *anyopaque, pkt: tcpip.PacketBuffer) stack.TransportProtocol.PortPair {
         _ = ptr;
         const v = pkt.data.first() orelse return .{ .src = 0, .dst = 0 };
+        if (v.len < 4) return .{ .src = 0, .dst = 0 };
         const h = header.TCP.init(v);
         return .{ .src = h.sourcePort(), .dst = h.destinationPort() };
     }
@@ -2206,7 +2207,13 @@ pub const TCPEndpoint = struct {
             return error.NoBufferSpace;
         }
         const node = try self.proto.packet_node_pool.acquire();
-        node.data = .{ .data = try pkt_data.cloneInPool(&self.proto.view_pool), .seq = seq };
+        node.data = .{
+            .data = pkt_data.cloneInPool(&self.proto.view_pool) catch |e| {
+                self.proto.packet_node_pool.release(node);
+                return e;
+            },
+            .seq = seq,
+        };
         if (it) |next| {
             self.ooo_list.insertBefore(next, node);
         } else {
@@ -2271,6 +2278,18 @@ fn seqAfter(a: u32, b: u32) bool {
 }
 fn seqAfterEq(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) >= 0;
+}
+
+test "TCP parsePorts rejects a segment too short to hold both ports" {
+    var bytes = [_]u8{ 0x12, 0x34, 0x56 };
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = &bytes }};
+    const pkt = tcpip.PacketBuffer{
+        .data = buffer.VectorisedView.init(bytes.len, &views),
+        .header = buffer.Prependable.init(&[_]u8{}),
+    };
+    const ports = TCPProtocol.parsePorts(undefined, pkt);
+    try std.testing.expectEqual(@as(u16, 0), ports.src);
+    try std.testing.expectEqual(@as(u16, 0), ports.dst);
 }
 
 test "NewReno slow start" {
