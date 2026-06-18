@@ -823,12 +823,24 @@ pub const TCPEndpoint = struct {
         }
     }
 
+    // Arm (or re-arm) the 2MSL timer as a bounded lifetime for the active-close
+    // sequence: any FIN-wait state (fin_wait1/fin_wait2/closing/last_ack) that stalls
+    // is reclaimed by handleTimeWaitTimer instead of leaking the endpoint forever.
+    fn armCloseTimeout(self: *TCPEndpoint) void {
+        self.stack.timer_queue.cancel(&self.time_wait_timer);
+        self.stack.timer_queue.schedule(&self.time_wait_timer, 2 * self.stack.tcp_msl);
+    }
+
     /// TIME_WAIT timer expiration (RFC 793 Section 3.5).
     /// After 2MSL, the connection can be fully closed and the 4-tuple reused.
     fn handleTimeWaitTimer(ptr: *anyopaque) void {
         const self: *TCPEndpoint = @ptrCast(@alignCast(ptr));
         // NOTE: RFC 793 Section 3.5 - TIME_WAIT to CLOSED after 2MSL
         self.state = .closed;
+        // This also backstops a stuck CLOSING endpoint, where the retransmit timer
+        // may still be armed; cancel it so it cannot fire on the reclaimed endpoint.
+        self.stack.timer_queue.cancel(&self.retransmit_timer);
+        self.stack.timer_queue.cancel(&self.delayed_ack_timer);
         if (self.local_addr) |la| {
             if (self.remote_addr) |ra| {
                 const term_id = stack.TransportEndpointID{
@@ -1330,10 +1342,12 @@ pub const TCPEndpoint = struct {
             // NOTE: RFC 793 Section 3.5 - ESTABLISHED to FIN_WAIT_1 (active close)
             self.state = .fin_wait1;
             self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck) catch {};
+            self.armCloseTimeout();
         } else if (self.state == .close_wait) {
             // NOTE: RFC 793 Section 3.5 - CLOSE_WAIT to LAST_ACK
             self.state = .last_ack;
             self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck) catch {};
+            self.armCloseTimeout();
         } else if (self.state == .listen) {
             self.state = .closed;
             if (self.local_addr) |la| {
@@ -1537,9 +1551,11 @@ pub const TCPEndpoint = struct {
             // NOTE: RFC 793 Section 3.5 - shutdown initiates FIN_WAIT_1
             self.state = .fin_wait1;
             try self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck);
+            self.armCloseTimeout();
         } else if (self.state == .close_wait) {
             self.state = .last_ack;
             try self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck);
+            self.armCloseTimeout();
         }
     }
 
@@ -2113,6 +2129,7 @@ pub const TCPEndpoint = struct {
                 if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) {
                     // NOTE: RFC 793 Section 3.5 - FIN_WAIT_1 to FIN_WAIT_2
                     self.state = .fin_wait2;
+                    self.armCloseTimeout();
                     acked = true;
                 }
                 if (fl & header.TCPFlagFin != 0) {
@@ -2121,10 +2138,14 @@ pub const TCPEndpoint = struct {
                     if (acked) {
                         // NOTE: RFC 793 Section 3.5 - FIN_WAIT_2 to TIME_WAIT
                         self.state = .time_wait;
-                        self.stack.timer_queue.schedule(&self.time_wait_timer, 2 * self.stack.tcp_msl);
+                        self.armCloseTimeout();
                     } else {
                         // NOTE: RFC 793 Section 3.5 - Simultaneous close: FIN_WAIT_1 to CLOSING
                         self.state = .closing;
+                        // Backstop: if the ACK of our FIN never arrives (lost ACK, peer
+                        // gone, send failure under load), reclaim after 2MSL instead of
+                        // leaking the endpoint stuck in CLOSING forever.
+                        self.armCloseTimeout();
                     }
                     notify_mask |= waiter.EventHUp;
                 }
@@ -2134,7 +2155,7 @@ pub const TCPEndpoint = struct {
                     // NOTE: RFC 793 Section 3.5 - FIN_WAIT_2 to TIME_WAIT
                     self.rcv_nxt +%= 1;
                     self.state = .time_wait;
-                    self.stack.timer_queue.schedule(&self.time_wait_timer, 2 * self.stack.tcp_msl);
+                    self.armCloseTimeout();
                     self.sendControl(header.TCPFlagAck) catch {};
                     notify_mask |= waiter.EventIn;
                 }
@@ -2143,7 +2164,8 @@ pub const TCPEndpoint = struct {
                 if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) {
                     // NOTE: RFC 793 Section 3.5 - CLOSING to TIME_WAIT
                     self.state = .time_wait;
-                    self.stack.timer_queue.schedule(&self.time_wait_timer, 2 * self.stack.tcp_msl);
+                    // Re-arm the 2MSL timer already running from the CLOSING backstop.
+                    self.armCloseTimeout();
                     notify_mask |= waiter.EventHUp;
                 }
             },
@@ -2171,8 +2193,7 @@ pub const TCPEndpoint = struct {
                 // FIN and restart the 2MSL timer.
                 if (fl & header.TCPFlagFin != 0) {
                     self.sendControl(header.TCPFlagAck) catch {};
-                    self.stack.timer_queue.cancel(&self.time_wait_timer);
-                    self.stack.timer_queue.schedule(&self.time_wait_timer, 2 * self.stack.tcp_msl);
+                    self.armCloseTimeout();
                 }
             },
             .closed => {
