@@ -60,6 +60,9 @@ pub const Config = struct {
     arp_pending_timeout_ms: i64 = 1000,
     /// Cluster pool prewarm count.
     cluster_pool_prewarm: usize = 1024,
+    // Hard cap on live transport endpoints (TCP connections, listeners, UDP).
+    // Registrations past it are rejected so the table cannot grow without bound.
+    max_endpoints: usize = 65536,
     /// Path MTU discovery: set DF on IPv4 egress and honor ICMP
     /// Fragmentation Needed / Packet Too Big (RFC 1191 / RFC 8201).
     ip_pmtud: bool = true,
@@ -405,7 +408,7 @@ pub const NIC = struct {
     // Register an address while reusing an existing per-protocol endpoint
     // instead of rebuilding it. addAddress() recreates the endpoint on every
     // call (IPv6 depends on that to run DAD per address), but DHCP applies its
-    // leased IPv4 address from inside packet dispatch — recreating there would
+    // leased IPv4 address from inside packet dispatch, and recreating there would
     // free the very endpoint still on the call stack. Safe only where the
     // endpoint does not key off its stored address (IPv4).
     pub fn addAddressReusingEndpoint(self: *NIC, addr: tcpip.ProtocolAddress) !void {
@@ -423,7 +426,7 @@ pub const NIC = struct {
     }
 
     // The per-protocol network endpoint is shared across a protocol's addresses,
-    // so it is left intact — only the address entry is dropped (used by DHCP on
+    // so it is left intact, and only the address entry is dropped (used by DHCP on
     // lease release/expiry to relinquish a leased address).
     pub fn removeAddress(self: *NIC, addr: tcpip.Address) void {
         var i: usize = 0;
@@ -780,11 +783,7 @@ pub const Stack = struct {
         const now_ms = std.time.milliTimestamp();
         const uptime_sec = @divFloor(now_ms - self.start_time_ms, 1000);
 
-        // Count TCP connections across all shards
-        var tcp_conn_count: usize = 0;
-        for (&self.endpoints.shards) |*shard| {
-            tcp_conn_count += shard.count();
-        }
+        const tcp_conn_count = self.liveEndpointCount();
 
         const link = &stats.global_link_stats;
 
@@ -829,7 +828,7 @@ pub const Stack = struct {
 
         // Bound the cache: ARP/NDP passive learning writes here on every valid
         // packet, so spoofed replies from many source IPs would grow it without
-        // limit. Entries carry no timestamp, so evict an arbitrary one — under a
+        // limit. Entries carry no timestamp, so evict an arbitrary one; under a
         // flood it is most likely attacker junk, and a legitimate peer is
         // re-learned on its next packet.
         if (is_new and self.link_addr_cache.count() >= MAX_LINK_ADDR_CACHE) {
@@ -903,12 +902,25 @@ pub const Stack = struct {
         return entry.mtu;
     }
 
+    fn liveEndpointCount(self: *Stack) usize {
+        var n: usize = 0;
+        for (&self.endpoints.shards) |*shard| n += shard.count();
+        return n;
+    }
+
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {
+        const shard = self.endpoints.getShard(id);
+        // Only a brand-new id grows the table; re-registering an existing id (bind
+        // then listen reuse it) does not, so only new ids are capped.
+        if (!shard.contains(id) and self.liveEndpointCount() >= self.config.max_endpoints) {
+            stats.global_stats.tcp.endpoints_dropped.inc();
+            return tcpip.Error.NoBufferSpace;
+        }
         ep.incRef();
         errdefer ep.decRef();
-        // put() would silently replace an existing entry, stranding its ref —
-        // bind() then listen() register the same id, for example.
-        const old = try self.endpoints.getShard(id).fetchPut(id, ep);
+        // fetchPut returns the entry it replaced; decRef it so re-registering an
+        // id (bind then listen) does not strand the previous endpoint's ref.
+        const old = try shard.fetchPut(id, ep);
         if (old) |kv| kv.value.decRef();
     }
 
