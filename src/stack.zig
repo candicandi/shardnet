@@ -60,6 +60,11 @@ pub const Config = struct {
     arp_pending_timeout_ms: i64 = 1000,
     /// Cluster pool prewarm count.
     cluster_pool_prewarm: usize = 1024,
+    // Hard cap on total clusters (16 KiB each) the cluster pool will allocate;
+    // acquire backpressures (drops) past it. cluster_pool_max_free caps idle
+    // clusters retained so a burst does not leave the pool permanently inflated.
+    cluster_pool_max: usize = 65536,
+    cluster_pool_max_free: usize = 8192,
     // Hard cap on live transport endpoints (TCP connections, listeners, UDP).
     // Registrations past it are rejected so the table cannot grow without bound.
     max_endpoints: usize = 65536,
@@ -684,6 +689,8 @@ pub const Stack = struct {
 
     pub fn initWithConfig(allocator: std.mem.Allocator, config: Config) !Stack {
         var cluster_pool = buffer.ClusterPool.init(allocator);
+        cluster_pool.max_clusters = config.cluster_pool_max;
+        cluster_pool.max_free = config.cluster_pool_max_free;
         try cluster_pool.prewarm(config.cluster_pool_prewarm);
         return .{
             .allocator = allocator,
