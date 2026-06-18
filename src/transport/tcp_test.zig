@@ -485,6 +485,52 @@ test "TCP SACK blocks generation" {
     try std.testing.expectEqual(@as(u32, 3000), ep.sack_blocks.items[0].start);
 }
 
+test "TCP out-of-order queue is bounded by the receive window" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var wq = waiter.Queue{};
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep: *TCPEndpoint = @ptrCast(@alignCast(ep_res.ptr));
+    defer ep.close();
+    ep.state = .established;
+    ep.rcv_nxt = 1000;
+    // Shrink the receive buffer so the bound is reachable in-test.
+    ep.rcv_wnd_max = 250;
+
+    var data = [_]u8{'X'} ** 100;
+    var src = try buffer.VectorisedView.fromSlice(&data, allocator, &s.cluster_pool);
+    defer src.deinit();
+
+    // Two 100-byte OOO segments fit (200 <= 250); a third would exceed the
+    // window and is dropped rather than buffered.
+    try ep.insertOOO(2000, src);
+    try ep.insertOOO(3000, src);
+    try std.testing.expectEqual(@as(usize, 200), ep.ooo_bytes);
+
+    const drops_before = shardnet.stats.global_stats.tcp.ooo_dropped.load();
+    try std.testing.expectError(error.NoBufferSpace, ep.insertOOO(4000, src));
+    try std.testing.expectEqual(@as(usize, 200), ep.ooo_bytes);
+    try std.testing.expect(ep.rcv_buf_used + ep.ooo_bytes <= ep.rcv_wnd_max);
+    try std.testing.expectEqual(drops_before + 1, shardnet.stats.global_stats.tcp.ooo_dropped.load());
+
+    // OOO bytes shrink the advertised window.
+    ep.recomputeRcvWnd();
+    try std.testing.expectEqual(@as(u32, 50), ep.rcv_wnd);
+
+    // Converting contiguous OOO data to in-order preserves the total
+    // receive-buffer budget, so the advertised window does not jump.
+    ep.rcv_nxt = 2000;
+    ep.processOOO();
+    try std.testing.expectEqual(@as(usize, 100), ep.ooo_bytes);
+    try std.testing.expectEqual(@as(usize, 100), ep.rcv_buf_used);
+}
+
 test "TCP window scaling negotiation" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
