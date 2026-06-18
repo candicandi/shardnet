@@ -32,6 +32,9 @@ pub const ProtocolNumber = 6;
 // Global token bucket bounding the rate of passive-open SYN processing (and thus
 // SYN-ACK emission) under a flood. Generous defaults; tunable at runtime.
 pub var syn_limiter: RateLimiter = .{ .max_tokens = 1024, .tokens = 1024, .refill_rate = 1024 };
+// RFC 5961 Section 10: challenge ACKs must be rate-limited or they become a
+// reflection/amplification vector (an in-window RST flood elicits one ACK each).
+pub var challenge_ack_limiter: RateLimiter = .{};
 
 /// TCP connection states per RFC 793 Section 3.2.
 /// State diagram: CLOSED -> (active open) SYN_SENT -> ESTABLISHED
@@ -1790,7 +1793,11 @@ pub const TCPEndpoint = struct {
                     if (seq == self.rcv_nxt) {
                         self.terminateWithError(tcpip.Error.ConnectionReset, &notify_mask);
                     } else if (seqAfter(seq, self.rcv_nxt) and seqBefore(seq, self.rcv_nxt +% self.rcv_wnd)) {
-                        self.sendControl(header.TCPFlagAck) catch {};
+                        if (challenge_ack_limiter.tryConsume()) {
+                            self.sendControl(header.TCPFlagAck) catch {};
+                        } else {
+                            stats.global_stats.tcp.challenge_acks_throttled.inc();
+                        }
                     }
                 },
                 else => {},
