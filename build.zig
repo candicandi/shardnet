@@ -71,12 +71,13 @@ pub fn build(b: *std.Build) void {
     // Discover *_test.zig files under src/ and compile each as a standalone
     // test artifact so zig build test exercises every test in the tree.
     // Platform-agnostic test files. `run = false` compiles a file (type-checked)
-    // without executing it — use to quarantine a file with known runtime failures.
+    // without executing it; use to quarantine a file with known runtime failures.
     const test_files = [_]struct { path: []const u8, run: bool }{
         .{ .path = "src/transport/tcp_test.zig", .run = true },
         .{ .path = "src/transport/tcp_2msl_test.zig", .run = true },
         .{ .path = "src/fuzz_test.zig", .run = true },
         .{ .path = "src/wire_conformance_test.zig", .run = true },
+        .{ .path = "src/ratelimit.zig", .run = true },
     };
 
     for (test_files) |tf| {

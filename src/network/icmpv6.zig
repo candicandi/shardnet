@@ -12,7 +12,7 @@ const buffer = @import("../buffer.zig");
 const waiter = @import("../waiter.zig");
 const log = @import("../log.zig").scoped(.icmpv6);
 const stats = @import("../stats.zig");
-const RateLimiter = @import("icmp.zig").RateLimiter;
+const RateLimiter = @import("../ratelimit.zig").RateLimiter;
 
 pub const ProtocolNumber = 58;
 

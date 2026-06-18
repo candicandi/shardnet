@@ -40,60 +40,7 @@ pub const TimeExceededCode = struct {
     pub const FRAGMENT_REASSEMBLY: u8 = 1;
 };
 
-/// Rate limiter using token bucket algorithm.
-/// Limits ICMP error messages to prevent amplification attacks.
-///
-/// NOTE: This implementation follows RFC 4443 Section 2.4 guidance on rate
-/// limiting ICMP error messages. The token bucket algorithm provides:
-///   1. Burst tolerance: up to max_tokens messages can be sent immediately
-///   2. Steady-state rate: refill_rate messages per second sustained
-///   3. Monotonic clock: uses std.time.milliTimestamp() which is backed by
-///      CLOCK_MONOTONIC on POSIX systems, immune to wall-clock adjustments
-///
-/// The default of 100 tokens with 100/sec refill allows brief bursts during
-/// legitimate error conditions while capping sustained rate at ~100 msg/sec.
-pub const RateLimiter = struct {
-    /// Maximum tokens (burst capacity).
-    max_tokens: u32 = 100,
-    /// Current available tokens.
-    tokens: u32 = 100,
-    /// Tokens refilled per second.
-    refill_rate: u32 = 100,
-    /// Last refill timestamp (ms) - monotonic clock, not wall time.
-    /// Zero means "not yet initialised"; refill() lazy-inits on first call.
-    last_refill_ms: i64 = 0,
-
-    pub fn init() RateLimiter {
-        return .{};
-    }
-
-    /// Try to consume a token. Returns true if allowed.
-    pub fn tryConsume(self: *RateLimiter) bool {
-        self.refill();
-        if (self.tokens > 0) {
-            self.tokens -= 1;
-            return true;
-        }
-        return false;
-    }
-
-    /// Refill tokens based on elapsed monotonic time.
-    fn refill(self: *RateLimiter) void {
-        const now = std.time.milliTimestamp();
-        // Lazy-init: milliTimestamp() cannot be called at comptime, so
-        // the first refill() seeds the clock instead.
-        if (self.last_refill_ms == 0) {
-            self.last_refill_ms = now;
-            return;
-        }
-        const elapsed_ms = now - self.last_refill_ms;
-        if (elapsed_ms >= 1000) {
-            const new_tokens = @as(u32, @intCast(@divFloor(elapsed_ms * self.refill_rate, 1000)));
-            self.tokens = @min(self.max_tokens, self.tokens + new_tokens);
-            self.last_refill_ms = now;
-        }
-    }
-};
+const RateLimiter = @import("../ratelimit.zig").RateLimiter;
 
 /// RTT measurement for echo replies.
 pub const RttMeasurement = struct {
@@ -272,7 +219,7 @@ pub const ICMPv4PacketHandler = struct {
         if ((orig[0] >> 4) != 4) return;
         const orig_src = tcpip.Address{ .v4 = orig[12..16].* };
         const orig_dst = tcpip.Address{ .v4 = orig[16..20].* };
-        // Only honor errors about packets we could actually have sent — the
+        // Only honor errors about packets we could actually have sent: the
         // cheap RFC 5927 check against off-path spoofing.
         if (!s.hasLocalAddress(orig_src)) return;
 
@@ -569,20 +516,6 @@ test "ICMP fragmentation needed updates the PMTU cache" {
     std.mem.writeInt(u16, msg[6..8], 600, .big);
     feed(&s, &r, &msg);
     try std.testing.expectEqual(@as(?u32, 1400), s.pmtuFor(path_dst));
-}
-
-test "ICMP rate limiter" {
-    var limiter = RateLimiter.init();
-    limiter.tokens = 5;
-
-    // Should allow 5 messages
-    var allowed: u32 = 0;
-    for (0..10) |_| {
-        if (limiter.tryConsume()) {
-            allowed += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(u32, 5), allowed);
 }
 
 test "RTT measurement" {

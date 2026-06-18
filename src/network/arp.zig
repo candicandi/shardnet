@@ -60,38 +60,7 @@ pub const CacheUpdatePolicy = enum {
     alert,
 };
 
-// Token bucket limiting outbound ARP requests, mirroring the ICMP rate limiter:
-// a flood of distinct unresolved next-hops would otherwise emit one request each.
-// Burst up to max_tokens, then refill_rate per second sustained.
-const RateLimiter = struct {
-    max_tokens: u32 = 100,
-    tokens: u32 = 100,
-    refill_rate: u32 = 100,
-    last_refill_ms: i64 = 0,
-
-    fn tryConsume(self: *RateLimiter) bool {
-        self.refill();
-        if (self.tokens == 0) return false;
-        self.tokens -= 1;
-        return true;
-    }
-
-    fn refill(self: *RateLimiter) void {
-        const now = std.time.milliTimestamp();
-        // Lazy-init: milliTimestamp() is not available at comptime, so the first
-        // refill seeds the clock instead of granting tokens.
-        if (self.last_refill_ms == 0) {
-            self.last_refill_ms = now;
-            return;
-        }
-        const elapsed_ms = now - self.last_refill_ms;
-        if (elapsed_ms >= 1000) {
-            const new_tokens: u32 = @intCast(@divFloor(elapsed_ms * self.refill_rate, 1000));
-            self.tokens = @min(self.max_tokens, self.tokens + new_tokens);
-            self.last_refill_ms = now;
-        }
-    }
-};
+const RateLimiter = @import("../ratelimit.zig").RateLimiter;
 
 pub const ARPProtocol = struct {
     // Secondary ARP cache. NOTE: currently unused by the RX path; passive
