@@ -309,6 +309,7 @@ pub const ICMPv6Stats = struct {
     rx_router_solicitations: Counter = .{},
     rx_router_advertisements: Counter = .{},
     tx_neighbor_advertisements: Counter = .{},
+    echo_replies_throttled: Counter = .{},
 };
 
 pub const UDPStats = struct {

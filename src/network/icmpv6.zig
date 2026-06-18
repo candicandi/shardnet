@@ -12,6 +12,7 @@ const buffer = @import("../buffer.zig");
 const waiter = @import("../waiter.zig");
 const log = @import("../log.zig").scoped(.icmpv6);
 const stats = @import("../stats.zig");
+const RateLimiter = @import("icmp.zig").RateLimiter;
 
 pub const ProtocolNumber = 58;
 
@@ -137,6 +138,11 @@ pub const ICMPv6TransportProtocol = struct {
 };
 
 pub const ICMPv6PacketHandler = struct {
+    // Bound outbound echo replies so a ping flood cannot make us reply without
+    // limit. Reuses the ICMPv4 token bucket (ICMPv6 emits no error messages here,
+    // so the echo reply is the only floodable response worth gating).
+    var rate_limiter: RateLimiter = RateLimiter.init();
+
     pub fn handlePacket(s: *stack.Stack, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {
         var mut_pkt = pkt;
         const v = mut_pkt.data.first() orelse return;
@@ -192,7 +198,7 @@ pub const ICMPv6PacketHandler = struct {
         if ((orig[0] >> 4) != 6) return;
         const orig_src = tcpip.Address{ .v6 = orig[8..24].* };
         const orig_dst = tcpip.Address{ .v6 = orig[24..40].* };
-        // Only honor errors about packets we could actually have sent — the
+        // Only honor errors about packets we could actually have sent: the
         // cheap RFC 5927 check against off-path spoofing.
         if (!s.hasLocalAddress(orig_src)) return;
         // RFC 8201: never below the IPv6 minimum link MTU.
@@ -201,6 +207,10 @@ pub const ICMPv6PacketHandler = struct {
     }
 
     fn handleEchoRequest(s: *stack.Stack, r: *const stack.Route, v: []const u8) void {
+        if (!rate_limiter.tryConsume()) {
+            stats.global_stats.icmpv6.echo_replies_throttled.inc();
+            return;
+        }
         const payload = s.allocator.alloc(u8, v.len) catch return;
         defer s.allocator.free(payload);
         @memcpy(payload, v);
@@ -592,6 +602,88 @@ test "ICMPv6 Neighbor Discovery" {
 
     const na = header.ICMPv6NA.init(na_pkt_data[40 + header.ICMPv6MinimumSize ..]);
     try std.testing.expectEqualStrings(&my_addr, &na.targetAddress());
+}
+
+test "ICMPv6 echo replies are rate limited" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var ipv6_proto = @import("ipv6.zig").IPv6Protocol.init();
+    try s.registerNetworkProtocol(ipv6_proto.protocol());
+    var icmpv6_transport = ICMPv6TransportProtocol.init();
+    try s.registerTransportProtocol(icmpv6_transport.protocol());
+
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{ 1, 2, 3, 4, 5, 6 } };
+        }
+        fn getMtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return stack.CapabilityNone;
+        }
+    }{};
+
+    const link_ep = stack.LinkEndpoint{
+        .ptr = &fake_link,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_link).writePacket,
+            .attach = @TypeOf(fake_link).attach,
+            .linkAddress = @TypeOf(fake_link).linkAddress,
+            .mtu = @TypeOf(fake_link).getMtu,
+            .setMTU = @TypeOf(fake_link).setMTU,
+            .capabilities = @TypeOf(fake_link).capabilities,
+        },
+    };
+
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+    const my_addr = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try nic.addAddress(.{ .protocol = 0x86dd, .address_with_prefix = .{ .address = .{ .v6 = my_addr }, .prefix_len = 64 } });
+
+    const sender_addr = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    const r = stack.Route{
+        .local_address = .{ .v6 = my_addr },
+        .remote_address = .{ .v6 = sender_addr },
+        .local_link_address = .{ .addr = [_]u8{ 1, 2, 3, 4, 5, 6 } },
+        .remote_link_address = .{ .addr = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff } },
+        .net_proto = 0x86dd,
+        .nic = nic,
+    };
+
+    var echo_buf = [_]u8{0} ** (header.ICMPv6MinimumSize + 8);
+    echo_buf[0] = header.ICMPv6EchoRequestType;
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = &echo_buf }};
+    const echo_pkt = tcpip.PacketBuffer{
+        .data = buffer.VectorisedView.init(echo_buf.len, &views),
+        .header = buffer.Prependable.init(&[_]u8{}),
+    };
+
+    // Constrain the shared limiter to a single token, restoring it afterwards so
+    // test ordering does not matter.
+    const saved = ICMPv6PacketHandler.rate_limiter;
+    defer ICMPv6PacketHandler.rate_limiter = saved;
+    ICMPv6PacketHandler.rate_limiter = RateLimiter.init();
+    ICMPv6PacketHandler.rate_limiter.max_tokens = 1;
+    ICMPv6PacketHandler.rate_limiter.tokens = 1;
+
+    const base_tx = stats.global_stats.icmpv6.tx_echo_replies.load();
+    const base_throttled = stats.global_stats.icmpv6.echo_replies_throttled.load();
+
+    // First echo request consumes the budget and is answered; the second is
+    // throttled (no reply emitted).
+    ICMPv6PacketHandler.handlePacket(&s, &r, echo_pkt);
+    ICMPv6PacketHandler.handlePacket(&s, &r, echo_pkt);
+
+    try std.testing.expectEqual(base_tx + 1, stats.global_stats.icmpv6.tx_echo_replies.load());
+    try std.testing.expectEqual(base_throttled + 1, stats.global_stats.icmpv6.echo_replies_throttled.load());
 }
 
 test "ICMPv6 Router Advertisement & SLAAC" {
