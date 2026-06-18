@@ -523,13 +523,11 @@ pub const Route = struct {
             if (link_addr_opt) |link_addr| {
                 self.remote_link_address = link_addr;
             } else {
-                // Queue packet for ARP resolution
-                try self.nic.stack.arp_pending.enqueue(.{
-                    .pkt = pkt,
-                    .next_hop = next_hop,
-                    .net_proto = self.net_proto,
-                    .timestamp_ms = std.time.milliTimestamp(),
-                });
+                // The caller releases pkt's header/payload on this WouldBlock
+                // return, so deep-copy into the queue; addLinkAddress retransmits
+                // once the next hop resolves. OOM just drops it (the upper layer
+                // retransmits), so the copy failure is not fatal.
+                self.nic.stack.arp_pending.enqueue(self, protocol, next_hop, pkt, self.nic.stack.allocator, &self.nic.stack.cluster_pool) catch {};
 
                 var it = self.nic.stack.network_protocols.valueIterator();
                 while (it.next()) |proto| {
@@ -541,6 +539,106 @@ pub const Route = struct {
 
         const net_ep = self.nic.network_endpoints.get(self.net_proto) orelse return tcpip.Error.NoRoute;
         return net_ep.writePacket(self, protocol, pkt);
+    }
+};
+
+// A packet held while its next hop is resolved by ARP/NDP. The enqueued copy is
+// deep (its own header buffer + cluster-backed payload): the originating sender
+// frees pkt's buffers as soon as writePacket returns WouldBlock, so a shallow
+// copy would dangle.
+const ArpPendingEntry = struct {
+    pkt: tcpip.PacketBuffer,
+    route: Route,
+    trans_proto: tcpip.TransportProtocolNumber,
+    next_hop: tcpip.Address,
+    timestamp_ms: i64,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ArpPendingEntry) void {
+        self.pkt.data.deinit();
+        self.allocator.free(self.pkt.header.buf);
+        self.* = undefined;
+    }
+};
+
+const ArpPendingQueue = struct {
+    entries: std.ArrayList(ArpPendingEntry),
+    max_entries: usize,
+    timeout_ms: i64,
+
+    fn init(allocator: std.mem.Allocator, max_entries: usize, timeout_ms: i64) ArpPendingQueue {
+        return .{
+            .entries = std.ArrayList(ArpPendingEntry).init(allocator),
+            .max_entries = max_entries,
+            .timeout_ms = timeout_ms,
+        };
+    }
+
+    fn deinit(self: *ArpPendingQueue) void {
+        for (self.entries.items) |*e| e.deinit();
+        self.entries.deinit();
+    }
+
+    fn enqueue(self: *ArpPendingQueue, route: *const Route, trans_proto: tcpip.TransportProtocolNumber, next_hop: tcpip.Address, pkt: tcpip.PacketBuffer, allocator: std.mem.Allocator, cluster_pool: *buffer.ClusterPool) !void {
+        if (self.entries.items.len >= self.max_entries) {
+            var evicted = self.entries.orderedRemove(0);
+            evicted.deinit();
+            stats.global_stats.arp.pending_drops.inc();
+        }
+        // Reserve the slot up front so no fallible step remains after the deep
+        // copy owns its buffers (otherwise an append failure would leak them).
+        try self.entries.ensureUnusedCapacity(1);
+
+        const hbuf = try allocator.alloc(u8, pkt.header.buf.len);
+        errdefer allocator.free(hbuf);
+        @memcpy(hbuf, pkt.header.buf);
+
+        const new_data = if (pkt.data.size == 0)
+            buffer.VectorisedView.empty()
+        else blk: {
+            const tmp = try pkt.data.toView(allocator);
+            defer allocator.free(tmp);
+            break :blk try buffer.VectorisedView.fromSlice(tmp, allocator, cluster_pool);
+        };
+
+        self.entries.appendAssumeCapacity(.{
+            .pkt = .{ .data = new_data, .header = .{ .buf = hbuf, .usedIdx = pkt.header.usedIdx } },
+            .route = route.*,
+            .trans_proto = trans_proto,
+            .next_hop = next_hop,
+            .timestamp_ms = std.time.milliTimestamp(),
+            .allocator = allocator,
+        });
+    }
+
+    // Remove and return entries waiting on `addr`; the caller retransmits each
+    // (the next hop is now known) and then deinits it.
+    fn drainForAddress(self: *ArpPendingQueue, addr: tcpip.Address) std.ArrayList(ArpPendingEntry) {
+        var result = std.ArrayList(ArpPendingEntry).init(self.entries.allocator);
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (self.entries.items[i].next_hop.eq(addr)) {
+                const removed = self.entries.orderedRemove(i);
+                result.append(removed) catch {
+                    var e = removed;
+                    e.deinit();
+                };
+            } else i += 1;
+        }
+        return result;
+    }
+
+    fn expireOld(self: *ArpPendingQueue, now_ms: i64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (now_ms - self.entries.items[i].timestamp_ms > self.timeout_ms) {
+                var e = self.entries.orderedRemove(i);
+                e.deinit();
+                removed += 1;
+            } else i += 1;
+        }
+        return removed;
     }
 };
 
@@ -668,7 +766,7 @@ pub const Stack = struct {
     route_table: RouteTable,
     timer_queue: time.TimerQueue,
     cluster_pool: buffer.ClusterPool,
-    arp_pending: tcpip.ArpPendingQueue,
+    arp_pending: ArpPendingQueue,
     ephemeral_port: u16,
     tcp_msl: u64,
     running: std.atomic.Value(bool),
@@ -704,7 +802,7 @@ pub const Stack = struct {
             .route_table = RouteTable.init(allocator),
             .timer_queue = .{},
             .cluster_pool = cluster_pool,
-            .arp_pending = tcpip.ArpPendingQueue.init(allocator, config.arp_pending_max),
+            .arp_pending = ArpPendingQueue.init(allocator, config.arp_pending_max, config.arp_pending_timeout_ms),
             .ephemeral_port = config.ephemeral_port_start,
             .tcp_msl = config.tcp_msl,
             .running = std.atomic.Value(bool).init(false),
@@ -727,8 +825,9 @@ pub const Stack = struct {
             shard.clearAndFree();
         }
         self.endpoints.deinit();
-        self.cluster_pool.deinit();
+        // Before the cluster pool: draining entries release clusters back to it.
         self.arp_pending.deinit();
+        self.cluster_pool.deinit();
         var nic_it = self.nics.valueIterator();
         while (nic_it.next()) |nic| {
             nic.*.deinit();
@@ -849,13 +948,15 @@ pub const Stack = struct {
 
         try self.link_addr_cache.put(addr, link_addr);
 
-        // Drain ARP pending queue for this address
+        // Retransmit packets that were waiting on this next hop, now that its
+        // link address is known, then release their queue-owned buffers.
         var pending = self.arp_pending.drainForAddress(addr);
         defer pending.deinit();
 
-        for (pending.items) |entry| {
-            // Re-send packets that were waiting
-            _ = entry; // Would retransmit here
+        for (pending.items) |*entry| {
+            entry.route.remote_link_address = link_addr;
+            entry.route.writePacket(entry.trans_proto, entry.pkt) catch {};
+            entry.deinit();
         }
 
         if (is_new) {
