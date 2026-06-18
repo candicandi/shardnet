@@ -1156,6 +1156,23 @@ test "Stack.init with config" {
     try std.testing.expectEqual(@as(u16, 49152), s.ephemeral_port);
 }
 
+test "health status serializes to valid JSON with the expected fields" {
+    const allocator = std.testing.allocator;
+    var s = try Stack.init(allocator);
+    defer s.deinit();
+
+    var buf: [512]u8 = undefined;
+    const json = try s.writeHealthJson(&buf);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(obj.contains("uptime_seconds"));
+    try std.testing.expect(obj.contains("tcp_connections"));
+    try std.testing.expect(obj.contains("rx_packets"));
+    try std.testing.expect(obj.contains("rx_drops"));
+}
+
 test "Stack PMTU cache: shrink-only while fresh, aging, bounded" {
     const allocator = std.testing.allocator;
     var s = try Stack.init(allocator);
