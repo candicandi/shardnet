@@ -73,7 +73,6 @@ pub const RttMeasurement = struct {
 };
 
 pub const ICMPv4TransportProtocol = struct {
-    rate_limiter: RateLimiter = RateLimiter.init(),
     owner_allocator: ?std.mem.Allocator = null,
 
     pub fn init() ICMPv4TransportProtocol {
