@@ -18,6 +18,7 @@ const Socket = shardnet.socket.Socket;
 const Loopback = shardnet.drivers.loopback.Loopback;
 const IPv4Protocol = shardnet.network.ipv4.IPv4Protocol;
 const TCPProtocol = shardnet.transport.tcp.TCPProtocol;
+const TCPEndpoint = shardnet.transport.tcp.TCPEndpoint;
 const tcpip = shardnet.tcpip;
 
 const SERVER_PORT: u16 = 8080;
@@ -258,6 +259,21 @@ pub fn main() !void {
     // Final drain and verdict.
     drain(&s, &lo);
     const fin = sample(&s, tcp_proto);
+
+    // On a leak, show which state the lingering endpoints are stuck in.
+    if (fin.endpoints > base.endpoints) {
+        var counts = [_]usize{0} ** 16;
+        for (&s.endpoints.shards) |*shard| {
+            var it = shard.valueIterator();
+            while (it.next()) |te| {
+                const tep: *TCPEndpoint = @ptrCast(@alignCast(te.ptr));
+                counts[@intFromEnum(tep.state)] += 1;
+            }
+        }
+        inline for (std.meta.fields(shardnet.transport.tcp.EndpointState)) |f| {
+            if (counts[f.value] > 0) try out.print("  stuck in {s}: {d}\n", .{ f.name, counts[f.value] });
+        }
+    }
     try out.print("\nfinal: batches={d} conns={d} MiB={d} endpoints={d} view_out={d} node_out={d} clusters={d} rss={d}KiB\n", .{ batches, conns_done, bytes_total / (1024 * 1024), fin.endpoints, fin.view_outstanding, fin.node_outstanding, fin.clusters, fin.rss / 1024 });
 
     var leaked = false;
