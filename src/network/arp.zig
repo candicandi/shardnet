@@ -60,8 +60,41 @@ pub const CacheUpdatePolicy = enum {
     alert,
 };
 
+// Token bucket limiting outbound ARP requests, mirroring the ICMP rate limiter:
+// a flood of distinct unresolved next-hops would otherwise emit one request each.
+// Burst up to max_tokens, then refill_rate per second sustained.
+const RateLimiter = struct {
+    max_tokens: u32 = 100,
+    tokens: u32 = 100,
+    refill_rate: u32 = 100,
+    last_refill_ms: i64 = 0,
+
+    fn tryConsume(self: *RateLimiter) bool {
+        self.refill();
+        if (self.tokens == 0) return false;
+        self.tokens -= 1;
+        return true;
+    }
+
+    fn refill(self: *RateLimiter) void {
+        const now = std.time.milliTimestamp();
+        // Lazy-init: milliTimestamp() is not available at comptime, so the first
+        // refill seeds the clock instead of granting tokens.
+        if (self.last_refill_ms == 0) {
+            self.last_refill_ms = now;
+            return;
+        }
+        const elapsed_ms = now - self.last_refill_ms;
+        if (elapsed_ms >= 1000) {
+            const new_tokens: u32 = @intCast(@divFloor(elapsed_ms * self.refill_rate, 1000));
+            self.tokens = @min(self.max_tokens, self.tokens + new_tokens);
+            self.last_refill_ms = now;
+        }
+    }
+};
+
 pub const ARPProtocol = struct {
-    // Secondary ARP cache. NOTE: currently unused by the RX path — passive
+    // Secondary ARP cache. NOTE: currently unused by the RX path; passive
     // learning writes to stack.link_addr_cache (the bounded, live cache). Kept
     // for the explicit updateCache/policy API; wire it up or remove it.
     cache: std.AutoHashMap(tcpip.Address, CacheEntry),
@@ -70,6 +103,7 @@ pub const ARPProtocol = struct {
     /// Defaults to .alert which logs potential spoofing but allows the update.
     update_policy: CacheUpdatePolicy = .alert,
     owner_allocator: ?std.mem.Allocator = null,
+    request_limiter: RateLimiter = .{},
 
     pub fn init(allocator: std.mem.Allocator) ARPProtocol {
         return .{
@@ -230,12 +264,20 @@ pub const ARPProtocol = struct {
     }
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
-        _ = ptr;
+        const self = @as(*ARPProtocol, @ptrCast(@alignCast(ptr)));
 
         const ep_opt = nic.network_endpoints.get(ProtocolNumber);
         if (ep_opt) |ep| {
             const arp_ep = @as(*ARPEndpoint, @ptrCast(@alignCast(ep.ptr)));
             if (!arp_ep.pending_requests.contains(addr)) {
+                // Rate-limit outbound resolution: a flood of distinct unresolved
+                // next-hops would otherwise emit one ARP request each. Out of budget,
+                // skip without recording pending so the next packet to this address
+                // retries once tokens refill.
+                if (!self.request_limiter.tryConsume()) {
+                    stats.global_stats.arp.requests_throttled.inc();
+                    return;
+                }
                 // Bound the pending table; drop the longest-waiting request to
                 // make room (matches the documented "oldest is dropped" policy).
                 if (arp_ep.pending_requests.count() >= MAX_PENDING_REQUESTS) {
@@ -601,4 +643,70 @@ test "ARP pending-request cap and link-address cache bound" {
     try std.testing.expectEqual(stack.MAX_LINK_ADDR_CACHE, @as(usize, s.link_addr_cache.count()));
     try std.testing.expectEqual(base_evict + 1, stats.global_stats.arp.cache_evictions.load());
     try std.testing.expect(s.link_addr_cache.get(.{ .v4 = .{ 10, 9, 9, 9 } }) != null);
+}
+
+test "ARP request rate limiting throttles a burst of distinct resolutions" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn getMtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return stack.CapabilityNone;
+        }
+    }{};
+
+    const link_ep = stack.LinkEndpoint{
+        .ptr = &fake_link,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_link).writePacket,
+            .attach = @TypeOf(fake_link).attach,
+            .linkAddress = @TypeOf(fake_link).linkAddress,
+            .mtu = @TypeOf(fake_link).getMtu,
+            .setMTU = @TypeOf(fake_link).setMTU,
+            .capabilities = @TypeOf(fake_link).capabilities,
+        },
+    };
+
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+
+    const ep = try allocator.create(ARPEndpoint);
+    ep.* = .{
+        .nic = nic,
+        .pending_requests = std.HashMap(tcpip.Address, i64, stack.Stack.AddressContext, 80).init(allocator),
+        .timer = time.Timer.init(ARPEndpoint.handleTimer, ep),
+    };
+    try nic.network_endpoints.put(ProtocolNumber, ep.networkEndpoint());
+
+    var proto = ARPProtocol.init(allocator);
+    defer proto.deinit();
+    // Tight budget so the burst is throttled within the test.
+    proto.request_limiter.max_tokens = 2;
+    proto.request_limiter.tokens = 2;
+
+    const local = tcpip.Address{ .v4 = .{ 10, 0, 0, 1 } };
+    const base_throttled = stats.global_stats.arp.requests_throttled.load();
+
+    // First two distinct resolutions consume the budget and are recorded pending;
+    // the third is throttled and left unrecorded so a later packet can retry it.
+    try ARPProtocol.linkAddressRequest(&proto, .{ .v4 = .{ 10, 0, 3, 1 } }, local, nic);
+    try ARPProtocol.linkAddressRequest(&proto, .{ .v4 = .{ 10, 0, 3, 2 } }, local, nic);
+    try std.testing.expectEqual(@as(usize, 2), ep.pending_requests.count());
+
+    try ARPProtocol.linkAddressRequest(&proto, .{ .v4 = .{ 10, 0, 3, 3 } }, local, nic);
+    try std.testing.expectEqual(@as(usize, 2), ep.pending_requests.count());
+    try std.testing.expect(!ep.pending_requests.contains(.{ .v4 = .{ 10, 0, 3, 3 } }));
+    try std.testing.expectEqual(base_throttled + 1, stats.global_stats.arp.requests_throttled.load());
 }

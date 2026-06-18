@@ -114,6 +114,7 @@ pub const ARPStatsSnapshot = struct {
     tx_replies: u64,
     cache_evictions: u64,
     pending_drops: u64,
+    requests_throttled: u64,
 };
 
 pub const LinkStatsSnapshot = struct {
@@ -246,6 +247,7 @@ pub const ARPStats = struct {
     tx_replies: Counter = .{},
     cache_evictions: Counter = .{},
     pending_drops: Counter = .{},
+    requests_throttled: Counter = .{},
 
     pub fn snapshot(self: *const ARPStats) ARPStatsSnapshot {
         return .{
@@ -255,6 +257,7 @@ pub const ARPStats = struct {
             .tx_replies = self.tx_replies.load(),
             .cache_evictions = self.cache_evictions.load(),
             .pending_drops = self.pending_drops.load(),
+            .requests_throttled = self.requests_throttled.load(),
         };
     }
 
@@ -265,6 +268,7 @@ pub const ARPStats = struct {
         self.tx_replies.store(0);
         self.cache_evictions.store(0);
         self.pending_drops.store(0);
+        self.requests_throttled.store(0);
     }
 };
 
