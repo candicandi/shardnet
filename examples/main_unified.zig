@@ -126,8 +126,8 @@ pub fn main() !void {
     // Create NIC based on selected driver
     switch (driver) {
         .loopback => {
-            const loopback = try allocator.create(shardnet.drivers.loopback.LoopbackEndpoint);
-            loopback.* = shardnet.drivers.loopback.LoopbackEndpoint.init();
+            const loopback = try allocator.create(shardnet.drivers.loopback.Loopback);
+            loopback.* = shardnet.drivers.loopback.Loopback.init(allocator);
             try s.createNIC(1, loopback.linkEndpoint());
             std.debug.print("Loopback interface created.\n", .{});
         },
