@@ -46,11 +46,11 @@ pub fn main() !void {
     const ip_cidr = args[3];
 
     global_stack = try shardnet.init(allocator);
-    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, ifname);
+    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, ifname, .{});
     global_eth = shardnet.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
 
-    var parts = std.mem.split(u8, ip_cidr, "/");
+    var parts = std.mem.splitScalar(u8, ip_cidr, '/');
     const ip_str = parts.first();
     const prefix_str = parts.next() orelse "24";
     const addr_v4 = try parseIp(ip_str);
@@ -458,7 +458,7 @@ const Connection = struct {
 };
 
 fn parseIp(str: []const u8) ![4]u8 {
-    var it = std.mem.split(u8, str, ".");
+    var it = std.mem.splitScalar(u8, str, '.');
     var out: [4]u8 = undefined;
     for (0..4) |i| out[i] = try std.fmt.parseInt(u8, it.next() orelse return error.InvalidIP, 10);
     return out;
