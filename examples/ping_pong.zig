@@ -155,7 +155,7 @@ pub fn main() !void {
 
 fn runBenchmark() void {
     // Simulate ping-pong latencies for demonstration
-    var prng = std.rand.DefaultPrng.init(12345);
+    var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
 
     var i: u32 = 0;

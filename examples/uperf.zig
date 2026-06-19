@@ -263,7 +263,7 @@ fn runBenchmark() void {
     var last_report = start;
 
     // Simulate throughput
-    var prng = std.rand.DefaultPrng.init(12345);
+    var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
 
     while (std.time.milliTimestamp() < end_time) {
